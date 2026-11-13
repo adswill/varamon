@@ -1,0 +1,8 @@
+varamon is an independent, receive-only implementation written from scratch.
+
+Sources of the waveform description:
+- measurements of publicly available recordings;
+- the published source of xara (https://github.com/x0rro/xara), MIT licence, copyright (c) 2026 x0rro, which was read as
+  documentation of the signal format. No xara code is included.
+
+VARA is the work of Jose Alberto Nieto Ros (EA5HVK). The VARA program was not disassembled, decompiled or otherwise examined.
