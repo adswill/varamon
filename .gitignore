@@ -7,3 +7,4 @@ dist/
 *.wav
 *.ogg
 *.pkl
+target/
