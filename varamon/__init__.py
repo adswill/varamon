@@ -1,2 +1,2 @@
-"""varamon: receive-only monitor for VARA HF signals (2300 Hz mode)."""
-__version__ = "0.1.0"
+"""varamon: receive-only monitor for VARA HF signals ."""
+__version__ = "0.2.0"

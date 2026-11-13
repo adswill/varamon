@@ -1,34 +1,63 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8"><title>varamon</title>
 <style>
 :root{color-scheme:light dark;--rule:color-mix(in srgb,CanvasText 22%,Canvas);--faint:color-mix(in srgb,CanvasText 6%,Canvas)}
-html,body{height:100%;margin:0}body{display:grid;grid-template-rows:auto minmax(120px,1fr) 150px auto;font:13px system-ui,sans-serif;background:Canvas;color:CanvasText}
-#bar{display:flex;align-items:center;gap:6px;padding:4px 6px;border-bottom:1px solid var(--rule);background:var(--faint)}#bar label{margin-left:8px}#bar .sep{width:1px;align-self:stretch;background:var(--rule);margin:0 4px}
+html,body{height:100%;margin:0}
+body{display:grid;grid-template-rows:auto auto minmax(120px,1fr) 170px auto;font:13px system-ui,sans-serif;background:Canvas;color:CanvasText}
+body.idle{grid-template-rows:auto minmax(120px,1fr) 170px auto}body.idle #fall{display:none}
+#bar{display:flex;align-items:center;gap:6px;padding:4px 6px;border-bottom:1px solid var(--rule);background:var(--faint)}#bar label{margin-left:8px}#bar .sep{width:1px;align-self:stretch;background:var(--rule);margin:0 4px}#bar select#device{max-width:260px}
+#fall{border-bottom:1px solid var(--rule);background:#000;position:relative;height:126px}
+#fall canvas{position:absolute;left:0;top:16px;width:100%;height:110px;image-rendering:pixelated}
+#scale{position:absolute;left:0;top:0;right:0;height:16px;background:var(--faint);color:GrayText;font:10px ui-monospace,Consolas,monospace;border-bottom:1px solid var(--rule)}
+#scale span{position:absolute;top:2px;transform:translateX(-50%)}#scale i{position:absolute;top:0;bottom:0;border-left:1px solid CanvasText;opacity:.5}
 #list{overflow:auto}table{border-collapse:collapse;width:100%;font:12px ui-monospace,SFMono-Regular,Consolas,monospace}
 th{position:sticky;top:0;background:var(--faint);border-bottom:1px solid var(--rule);border-right:1px solid var(--rule);text-align:left;font:12px system-ui,sans-serif;padding:2px 6px}
-td{padding:1px 6px;white-space:nowrap;border-right:1px solid var(--faint)}tbody tr:nth-child(even){background:var(--faint)}tbody tr.sel{background:Highlight;color:HighlightText}tr.bad td{color:GrayText}tr.sel td{color:inherit}
-#hex{overflow:auto;padding:4px 8px;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre;margin:0;border-top:1px solid var(--rule)}
-#status{display:flex;gap:16px;padding:2px 8px;border-top:1px solid var(--rule);background:var(--faint);font-size:12px}#status span:first-child{flex:1}.err{color:#c00}
-</style></head><body>
-<div id="bar"><button id="open">Open…</button><input id="file" type="file" accept=".wav" hidden><span class="sep"></span><label for="device">Input</label><select id="device"><option value="">System default</option></select><button id="listen">Start</button><span class="sep"></span><button id="clear">Clear</button></div>
-<div id="list"><table><thead><tr><th>No.</th><th>Time</th><th>Length</th><th>Type</th><th>Level</th><th>Bytes</th><th>CRC</th><th>Reply</th><th>Flags</th><th>Score</th></tr></thead><tbody id="rows"></tbody></table></div>
-<pre id="hex"></pre><div id="status"><span id="msg">Ready. 2300 Hz mode, levels 1-16.</span><span id="lvl"></span><span id="count">0 frames</span></div>
+td{padding:1px 6px;white-space:nowrap;border-right:1px solid var(--faint)}td:last-child{width:100%}
+tbody tr:nth-child(even){background:var(--faint)}tbody tr.sel{background:Highlight;color:HighlightText}tr.bad td{color:GrayText}tr.sel td{color:inherit}
+#lower{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,3fr);border-top:1px solid var(--rule);min-height:0}
+#detail,#hex{overflow:auto;padding:4px 8px;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre;margin:0}#hex{border-left:1px solid var(--rule)}
+#status{display:flex;gap:16px;padding:2px 8px;border-top:1px solid var(--rule);background:var(--faint);font-size:12px}#status span:first-child{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.err{color:#c00}
+</style></head><body class="idle">
+<div id="bar"><button id="open">Open…</button><input id="file" type="file" accept=".wav" hidden><span class="sep"></span><label for="device">Input</label><select id="device"><option value="">System default</option></select><button id="listen">Start</button><span class="sep"></span><label><input type="checkbox" id="onlyok"> Decoded only</label><span class="sep"></span><button id="clear">Clear</button><button id="save">Export CSV</button></div>
+<div id="fall"><div id="scale"></div><canvas id="wf" width="1024" height="110"></canvas></div>
+<div id="list"><table><thead><tr><th>No.</th><th>Time</th><th>Length</th><th>Mode</th><th>Level</th><th>Signal</th><th>Bytes</th><th>CRC</th><th>Reply</th><th>Flags</th></tr></thead><tbody id="rows"></tbody></table></div>
+<div id="lower"><pre id="detail"></pre><pre id="hex"></pre></div>
+<div id="status"><span id="msg">Ready</span><span id="lvl"></span><span id="count">0 frames</span></div>
 <script>
-const $=id=>document.getElementById(id);let log=[],ctx=null,stream=null,proc=null,pend=[],pn=0,chain=Promise.resolve(),wall=0;
+const $=id=>document.getElementById(id),TOP=3200;
+let log=[],sel=-1,ctx=null,stream=null,proc=null,analyser=null,pend=[],pn=0,chain=Promise.resolve(),wall=0,timer=0;
+const SIGNAL=f=>f.kind=='fsk'?'tone-keyed, '+[0,23,47,47,94][f.level]+' symbols/s':f.kind=='psk'?[0,0,0,0,0,3,4,6,8,10][f.level]+' carriers, 4-phase':'OFDM 49 carriers, '+({10:'4-phase',11:'4-phase',12:'4-phase',13:'8-phase',14:'8-phase',15:'16QAM',16:'32QAM'}[f.level]||'');
 function status(t,e){$('msg').textContent=t;$('msg').className=e?'err':''}
 function hms(ms){return new Date(ms).toTimeString().slice(0,8)}
-function add(f,time){log.push(f);const tr=$('rows').insertRow(),i=log.length-1;
- [i+1,time,f.dur.toFixed(2)+' s',f.kind.toUpperCase(),f.level,f.size,f.ok?'OK':'wrong',f.ok?f.reply:'',f.ok?[f.compressed?'compressed':'',f.last?'last':'',f.full?'full':''].filter(Boolean).join(' '):'',f.score.toFixed(2)].forEach(v=>tr.insertCell().textContent=v);
- if(!f.ok)tr.className='bad';tr.onclick=()=>{[...$('rows').rows].forEach(r=>r.classList.remove('sel'));tr.classList.add('sel');$('hex').textContent=f.ok?f.hex.match(/.{1,32}/g).map((l,n)=>String(n*16).padStart(4,'0')+'  '+l.match(/../g).join(' ')).join('\n'):'checksum failed'};
- $('count').textContent=log.length+' frames';$('list').scrollTop=$('list').scrollHeight}
-async function openFile(f){status('Decoding '+f.name+'…');try{const j=await(await fetch('/file',{method:'POST',body:f})).json();if(j.error){status(j.error,true);return}j.frames.forEach(q=>add(q,q.t.toFixed(2)+' s'));status(f.name+' — '+j.seconds+' s, '+j.frames.filter(q=>q.ok).length+' of '+j.frames.length+' transmissions decoded')}catch(e){status(String(e),true)}}
+function flags(f){return [f.compressed?'compressed':'',f.last?'last':'',f.full?'full':''].filter(Boolean).join(' ')}
+function row(f,i){const tr=$('rows').insertRow();tr.dataset.i=i;[i+1,f.shown,f.dur.toFixed(2)+' s',f.bw+' Hz',f.level,SIGNAL(f),f.size,f.ok?'OK':'failed',f.ok?f.reply:'',f.ok?flags(f):''].forEach(v=>tr.insertCell().textContent=v);if(!f.ok)tr.className='bad';tr.onclick=()=>select(i)}
+function refill(){$('rows').innerHTML='';log.forEach((f,i)=>{if(f.ok||!$('onlyok').checked)row(f,i)});select(sel)}
+function add(f,shown){f.shown=shown;log.push(f);const l=$('list'),follow=l.scrollTop+l.clientHeight>=l.scrollHeight-30;if(f.ok||!$('onlyok').checked)row(f,log.length-1);
+ $('count').textContent=log.filter(q=>q.ok).length+' decoded / '+log.length+' transmissions';if(follow){l.scrollTop=l.scrollHeight;select(log.length-1)}}
+function select(i){const old=$('rows').querySelector('tr.sel');if(old)old.classList.remove('sel');sel=i;const f=log[i];if(!f){$('detail').textContent=$('hex').textContent='';return}
+ const tr=$('rows').querySelector('tr[data-i="'+i+'"]');if(tr){tr.classList.add('sel');tr.scrollIntoView({block:'nearest'})}
+ const d=[['Time',f.shown],['Length',f.dur.toFixed(2)+' s'],['Mode',f.bw+' Hz'],['Level',f.level],['Signal',SIGNAL(f)],['Frame',f.size+' bytes'],['CRC',f.ok?'correct':'failed'],['Pattern match',f.score.toFixed(2)]];
+ if(f.ok)d.push(['Payload',(f.size-3)+' bytes'],['Reply counter',f.reply],['Compressed',f.compressed?'yes':'no'],['Last frame',f.last?'yes':'no'],['Payload full',f.full?'yes':'no']);
+ $('detail').textContent=d.map(([k,v])=>(k+':').padEnd(16)+v).join('\n');
+ $('hex').textContent=f.ok?f.hex.match(/.{1,32}/g).map((l,n)=>{const b=l.match(/../g);return (n*16).toString(16).padStart(4,'0')+'  '+b.join(' ').padEnd(47)+'  '+b.map(x=>{const c=parseInt(x,16);return c>=32&&c<127?String.fromCharCode(c):'.'}).join('')}).join('\n'):'not decoded'}
+async function openFile(f){if(ctx)stop();status('Decoding '+f.name+'…');try{const j=await(await fetch('/file',{method:'POST',body:f})).json();if(j.error){status(f.name+': '+j.error,true);return}j.frames.forEach(q=>add(q,q.t.toFixed(2)+' s'));status(f.name+' — '+j.seconds+' s, '+j.frames.filter(q=>q.ok).length+' of '+j.frames.length+' transmissions decoded')}catch(e){status(f.name+': '+e.message,true)}}
 async function devices(){const s=$('device'),k=s.value;const d=(await navigator.mediaDevices.enumerateDevices()).filter(x=>x.kind=='audioinput'&&x.deviceId&&x.deviceId!='default');s.length=1;d.forEach((x,i)=>s.add(new Option(x.label||'Input '+(i+1),x.deviceId)));s.value=[...s.options].some(o=>o.value==k)?k:''}
 function flush(){const pcm=new Int16Array(pn);let o=0;for(const p of pend)for(let i=0;i<p.length;i++)pcm[o++]=Math.max(-32768,Math.min(32767,p[i]*32767));pend=[];pn=0;const w=wall;
  chain=chain.then(()=>fetch('/audio?rate='+ctx.sampleRate,{method:'POST',body:pcm.buffer})).then(r=>r.json()).then(j=>(j.frames||[]).forEach(q=>add(q,hms(w+q.t*1000)))).catch(()=>status('Decoder not reachable',true))}
+const PAL=(()=>{const st=[[0,0,0],[0,0,140],[0,170,220],[240,230,40],[230,40,20],[255,255,255]],p=new Uint8Array(768);for(let i=0;i<256;i++){const x=i/255*(st.length-1),a=Math.min(st.length-2,Math.floor(x)),f=x-a;for(let c=0;c<3;c++)p[i*3+c]=st[a][c]+(st[a+1][c]-st[a][c])*f}return p})();
+function waterfall(){if(!analyser)return;const c=$('wf'),g=c.getContext('2d'),bins=new Float32Array(analyser.frequencyBinCount);analyser.getFloatFrequencyData(bins);g.drawImage(c,0,1);
+ const line=g.createImageData(c.width,1),n=TOP/(ctx.sampleRate/2)*bins.length;for(let x=0;x<c.width;x++){const v=bins[Math.floor(x/c.width*n)],k=Math.max(0,Math.min(255,Math.round((v+105)/75*255)))*3;line.data.set([PAL[k],PAL[k+1],PAL[k+2],255],x*4)}g.putImageData(line,0,0);
+ const t=new Float32Array(analyser.fftSize);analyser.getFloatTimeDomainData(t);let p=0,pk=0;for(const v of t){p+=v*v;pk=Math.max(pk,Math.abs(v))}$('lvl').textContent='Level '+(p?(10*Math.log10(p/t.length)).toFixed(0):'-inf')+' dBFS'+(pk>0.98?'  CLIP':'')}
 async function start(){try{const id=$('device').value;stream=await navigator.mediaDevices.getUserMedia({audio:{deviceId:id?{exact:id}:undefined,echoCancellation:false,noiseSuppression:false,autoGainControl:false}})}catch(e){status('Cannot open audio input: '+e.message,true);return}
- await devices();await fetch('/reset',{method:'POST'});ctx=new AudioContext();const src=ctx.createMediaStreamSource(stream),mute=ctx.createGain();proc=ctx.createScriptProcessor(4096,1,1);mute.gain.value=0;src.connect(proc);proc.connect(mute);mute.connect(ctx.destination);wall=Date.now();
- proc.onaudioprocess=e=>{const d=e.inputBuffer.getChannelData(0);pend.push(new Float32Array(d));pn+=d.length;let p=0;for(const v of d)p+=v*v;$('lvl').textContent='Level '+(p?(10*Math.log10(p/d.length)).toFixed(0):'-inf')+' dBFS';if(pn>=ctx.sampleRate)flush()};
- $('listen').textContent='Stop';status('Receiving from '+$('device').selectedOptions[0].textContent+' at '+ctx.sampleRate+' Hz')}
-function stop(){if(proc)proc.disconnect();if(stream)stream.getTracks().forEach(t=>t.stop());if(ctx)ctx.close();ctx=stream=proc=null;$('listen').textContent='Start';$('lvl').textContent='';status('Stopped')}
-$('open').onclick=()=>$('file').click();$('file').onchange=e=>{if(e.target.files[0])openFile(e.target.files[0]);e.target.value=''};$('listen').onclick=()=>ctx?stop():start();$('clear').onclick=()=>{$('rows').innerHTML='';log=[];$('hex').textContent='';$('count').textContent='0 frames'};
-addEventListener('dragover',e=>e.preventDefault());addEventListener('drop',e=>{e.preventDefault();if(e.dataTransfer.files[0])openFile(e.dataTransfer.files[0])});if(navigator.mediaDevices)devices();
+ await devices();await fetch('/reset',{method:'POST'});ctx=new AudioContext();const src=ctx.createMediaStreamSource(stream),mute=ctx.createGain();analyser=ctx.createAnalyser();analyser.fftSize=4096;analyser.smoothingTimeConstant=0;src.connect(analyser);
+ proc=ctx.createScriptProcessor(4096,1,1);mute.gain.value=0;src.connect(proc);proc.connect(mute);mute.connect(ctx.destination);wall=Date.now();pend=[];pn=0;
+ proc.onaudioprocess=e=>{const d=e.inputBuffer.getChannelData(0);pend.push(new Float32Array(d));pn+=d.length;if(pn>=ctx.sampleRate)flush()};
+ document.body.classList.remove('idle');$('listen').textContent='Stop';status('Receiving from '+$('device').selectedOptions[0].textContent+' at '+ctx.sampleRate+' Hz');timer=setInterval(waterfall,50)}
+function stop(){clearInterval(timer);if(proc)proc.disconnect();if(stream)stream.getTracks().forEach(t=>t.stop());if(ctx)ctx.close();ctx=stream=proc=analyser=null;document.body.classList.add('idle');$('listen').textContent='Start';$('lvl').textContent='';status('Stopped')}
+for(let f=0;f<=TOP;f+=400){const s=document.createElement('span');s.style.left=Math.min(98.5,Math.max(1.5,f/TOP*100))+'%';s.textContent=f;$('scale').append(s)}
+for(const f of [350,1250,1750,2650]){const m=document.createElement('i');m.style.left=f/TOP*100+'%';$('scale').append(m)}
+$('open').onclick=()=>$('file').click();$('file').onchange=e=>{if(e.target.files[0])openFile(e.target.files[0]);e.target.value=''};$('listen').onclick=()=>ctx?stop():start();$('device').onchange=()=>{if(ctx){stop();start()}};$('onlyok').onchange=refill;
+$('clear').onclick=()=>{$('rows').innerHTML='';log=[];sel=-1;select(-1);$('count').textContent='0 frames'};
+$('save').onclick=()=>{const q=v=>'"'+String(v==null?'':v).replace(/"/g,'""')+'"';const out=['no,time,length_s,mode_hz,level,signal,bytes,crc,reply,flags,frame_hex'].concat(log.map((f,i)=>[i+1,f.shown,f.dur,f.bw,f.level,SIGNAL(f),f.size,f.ok?'ok':'failed',f.ok?f.reply:'',f.ok?flags(f):'',f.ok?f.hex:''].map(q).join(',')));const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([out.join('\r\n')+'\r\n'],{type:'text/csv'}));a.download='varamon.csv';a.click()};
+addEventListener('keydown',e=>{if(e.key!='ArrowDown'&&e.key!='ArrowUp')return;const rs=[...$('rows').rows],k=rs.findIndex(r=>r.dataset.i==sel),n=rs[k+(e.key=='ArrowDown'?1:-1)];if(n){select(+n.dataset.i);e.preventDefault()}});
+addEventListener('dragover',e=>e.preventDefault());addEventListener('drop',e=>{e.preventDefault();if(e.dataTransfer.files[0])openFile(e.dataTransfer.files[0])});if(navigator.mediaDevices){devices();navigator.mediaDevices.addEventListener('devicechange',devices)}
 </script></body></html>

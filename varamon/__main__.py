@@ -7,7 +7,7 @@ from . import __version__
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="varamon", description="receive-only monitor for VARA HF signals (2300 Hz mode)")
+    p = argparse.ArgumentParser(prog="varamon", description="receive-only monitor for VARA HF signals")
     p.add_argument("files", nargs="*", help="16-bit WAV recordings of the receiver audio (USB)")
     p.add_argument("--hex", action="store_true", help="print the bytes of each decoded frame")
     p.add_argument("--ui", action="store_true", help="open the web page (default when no file is given)")

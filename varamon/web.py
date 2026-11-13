@@ -7,7 +7,7 @@ HERE=os.path.dirname(os.path.abspath(__file__)); T=None; lock=threading.Lock()
 L=dict(buf=np.zeros(0),base=0,done=0,rate=48000)
 def row(q,t):
     fr=q['frame']; c=fr[-3] if len(fr)>=3 else 0
-    return dict(t=round(t,2),dur=round(q['dur'],2),kind=q['kind'],level=q['level'],ok=bool(q['ok']),size=len(fr),score=round(float(q['score']),2),
+    return dict(t=round(t,2),dur=round(q['dur'],2),kind=q['kind'],level=q['level'],bw=q.get('bw',2300),ok=bool(q['ok']),size=len(fr),score=round(float(q['score']),2),
                 reply=c>>6,compressed=(c>>5)&1,last=(c>>1)&1,full=c&1,hex=fr.hex())
 def to48(x,rate):
     if rate==48000: return x
@@ -21,7 +21,7 @@ def feed(samples,rate):
         if b>len(x)-38400 or L['base']+a<L['done']: continue
         s=x[max(0,a-96000):b+33600]; r=varahf.decode_segment(s,T)
         if r:
-            k,lv,fr,ok,score=r; out.append(row(dict(dur=(b-a)/48000,kind=k,level=lv,ok=ok,frame=fr,score=score),(L['base']+a)/48000))
+            k,lv,fr,ok,score,bw=r; out.append(row(dict(dur=(b-a)/48000,kind=k,level=lv,ok=ok,frame=fr,score=score,bw=bw),(L['base']+a)/48000))
         L['done']=L['base']+b
     keep=20*48000
     if len(x)>keep: L['base']+=len(x)-keep; L['buf']=x[-keep:]
