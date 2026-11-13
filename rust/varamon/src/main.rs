@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use varamon_core::{audio, scan};
+use varamon_core::{audio, frame, scan};
 
 const USAGE: &str = "usage: varamon [--hex] RECORDING.wav ...
 
@@ -43,27 +43,39 @@ fn main() -> ExitCode {
         let name = Path::new(path).file_name().map_or(path.as_str().into(), |n| n.to_string_lossy());
         println!("{name}: {:.1} s", x.len() as f64 / audio::RATE as f64);
         let found = scan::scan(&x, &tables, |f| {
-            let c = if f.frame.len() >= 3 { f.frame[f.frame.len() - 3] } else { 0 };
-            println!(
-                "{:8.2} s  {:5.2} s  fsk  {:4} Hz level {:2}  {:4} bytes  CRC {:<5}  control {:02x} (reply {}, compressed {}, last {}, full {})  score {:.2}  offset {:+.0} Hz",
-                f.time,
-                f.seconds,
-                f.mode,
-                f.level,
-                f.frame.len(),
-                if f.crc_ok { "OK" } else { "wrong" },
-                c,
-                c >> 6,
-                (c >> 5) & 1,
-                (c >> 1) & 1,
-                c & 1,
-                f.score,
-                f.offset
-            );
-            if hex && f.crc_ok {
+            let station = (b'A' + f.station as u8) as char;
+            let head = format!("{:8.2} s  {:5.2} s  station {station}  {:4} Hz L{:<2} {:5.1} dB  ", f.time, f.seconds, f.mode, f.level, f.level_db);
+            if !f.crc_ok {
+                println!("{head}not decoded (CRC failed, pattern match {:.2})", f.score);
+                return;
+            }
+            let Some(p) = frame::parse(&f.frame) else { return };
+            let flags = [(p.last, "last"), (p.compressed, "compressed")].iter().filter(|x| x.0).map(|x| x.1).collect::<Vec<_>>().join(", ");
+            let content = match &p.data {
+                None => "payload not terminated".to_string(),
+                Some(d) if d.is_empty() => "empty".to_string(),
+                Some(d) if frame::is_text(d) && !p.compressed => format!("text  \"{}\"", frame::text_of(d)),
+                Some(d) => format!("data  {} bytes", d.len()),
+            };
+            println!("{head}{content}{}", if flags.is_empty() { String::new() } else { format!("  [{flags}]") });
+            if hex {
                 println!("            {}", f.frame.iter().map(|b| format!("{b:02x}")).collect::<String>());
             }
         });
+        let stations = found.iter().map(|f| f.station + 1).max().unwrap_or(0);
+        for s in 0..stations {
+            let data = scan::stream_of(&found, s);
+            let frames = found.iter().filter(|f| f.crc_ok && f.station == s).count();
+            let name = (b'A' + s as u8) as char;
+            if data.is_empty() {
+                println!("station {name}: {frames} frames, no payload");
+            } else if frame::is_text(&data) {
+                println!("station {name}: {frames} frames, {} bytes of text:\n  {}", data.len(), frame::text_of(&data).replace("\\n", "\n  "));
+            } else {
+                let runs = frame::text_runs(&data, 8);
+                println!("station {name}: {frames} frames, {} bytes, not plain text (compressed or binary){}", data.len(), if runs.is_empty() { String::new() } else { format!("; readable pieces: {}", runs.join(" | ")) });
+            }
+        }
         println!("{} transmissions, {} decoded with correct CRC\n", found.len(), found.iter().filter(|f| f.crc_ok).count());
     }
     status

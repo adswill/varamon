@@ -36,10 +36,14 @@ pub struct Found {
     pub crc_ok: bool,
     pub score: f64,
     pub offset: f64,
+    /// signal level of the transmission in dB (relative)
+    pub level_db: f64,
+    /// which station sent it: 0, 1, ... in order of first appearance
+    pub station: usize,
 }
 
 /// Transmissions as (first sample, last sample), found by energy between 300 and 2900 Hz.
-pub fn segments(x: &[f64]) -> Vec<(usize, usize)> {
+pub fn segments(x: &[f64]) -> Vec<(usize, usize, f64)> {
     let n = x.len();
     if n < RATE {
         return Vec::new();
@@ -81,7 +85,18 @@ pub fn segments(x: &[f64]) -> Vec<(usize, usize)> {
             _ => merged.push((a, b)),
         }
     }
-    merged.into_iter().filter(|(a, b)| (b - a) * BLOCK >= 3 * RATE).map(|(a, b)| (a * BLOCK, b * BLOCK)).collect()
+    merged
+        .into_iter()
+        .filter(|(a, b)| (b - a) * BLOCK >= 3 * RATE)
+        .map(|(a, b)| {
+            // level from the loudest half of the blocks, so fades do not pull it down
+            let mut v: Vec<f64> = e[a..b].to_vec();
+            v.sort_by(|p, q| q.total_cmp(p));
+            let top = &v[..v.len().div_ceil(2)];
+            let rms = (top.iter().map(|x| x * x).sum::<f64>() / top.len() as f64).sqrt();
+            (a * BLOCK, b * BLOCK, 20.0 * rms.max(1e-9).log10())
+        })
+        .collect()
 }
 
 /// Decode one transmission: try every tone-keyed level of every mode that fits its length.
@@ -110,11 +125,25 @@ fn decode_segment(s: &[f64], tables: &Tables) -> Option<(u32, u32, crate::fsk::D
 /// Scan a recording at 48 kHz. `report` is called for each transmission as it is decoded.
 pub fn scan(x: &[f64], tables: &Tables, mut report: impl FnMut(&Found)) -> Vec<Found> {
     let mut out = Vec::new();
-    for (a, b) in segments(x) {
+    let mut stations: Vec<(f64, f64, usize)> = Vec::new(); // level, tuning offset, frames seen
+    for (a, b, level_db) in segments(x) {
         // 2 s margin before and 0.7 s after: a faded start or end is common off air
         let lo = a.saturating_sub(2 * RATE);
         let hi = (b + RATE * 7 / 10).min(x.len());
         if let Some((mode, level, d)) = decode_segment(&x[lo..hi], tables) {
+            // the same station comes back at about the same level and tuning
+            let station = match stations.iter().position(|s| (s.0 - level_db).abs() <= 2.5 && (s.1 - d.offset).abs() <= 6.0) {
+                Some(i) => {
+                    let s = &mut stations[i];
+                    s.0 = (s.0 * s.2 as f64 + level_db) / (s.2 + 1) as f64;
+                    s.2 += 1;
+                    i
+                }
+                None => {
+                    stations.push((level_db, d.offset, 1));
+                    stations.len() - 1
+                }
+            };
             let f = Found {
                 time: a as f64 / RATE as f64,
                 seconds: (b - a) as f64 / RATE as f64,
@@ -124,9 +153,28 @@ pub fn scan(x: &[f64], tables: &Tables, mut report: impl FnMut(&Found)) -> Vec<F
                 crc_ok: d.crc_ok,
                 score: d.score,
                 offset: d.offset,
+                level_db,
+                station,
             };
             report(&f);
             out.push(f);
+        }
+    }
+    out
+}
+
+/// The payloads of one station joined in time order. Exact repeats of the previous frame (a
+/// retransmission after a missed acknowledgement) are dropped.
+pub fn stream_of(found: &[Found], station: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut prev: Option<&[u8]> = None;
+    for f in found.iter().filter(|f| f.crc_ok && f.station == station) {
+        if prev == Some(&f.frame[..]) {
+            continue;
+        }
+        prev = Some(&f.frame[..]);
+        if let Some(data) = crate::frame::parse(&f.frame).and_then(|p| p.data) {
+            out.extend(data);
         }
     }
     out

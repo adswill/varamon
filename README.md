@@ -98,6 +98,7 @@ The project is being moved to Rust. The Rust version lives in `rust/` and will r
 | Tone-keyed levels, all three bandwidth modes | yes | yes |
 | Phase-keyed levels 5-9, OFDM levels 10-16 | yes | not yet |
 | Command line for recordings | yes | yes |
+| Payload, stations, joined streams and text display | no | yes |
 | Web page and live audio input | yes | not yet |
 | Rig control through Hamlib | no | not yet |
 
