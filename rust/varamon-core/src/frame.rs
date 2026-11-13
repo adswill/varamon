@@ -78,6 +78,42 @@ pub fn text_runs(data: &[u8], min: usize) -> Vec<String> {
     out
 }
 
+/// Undo the modem's "files" compression: the stream is a series of chunks, each with a 2-byte
+/// header (top bit: the body is DEFLATE data; low 15 bits: body length). Returns the unpacked
+/// bytes and whether the stream ended cleanly at a chunk boundary.
+pub fn unpack_files(stream: &[u8]) -> Option<(Vec<u8>, bool)> {
+    const MAX_INFLATED: usize = 50_000;
+    let mut out = Vec::new();
+    let mut pos = 0;
+    let mut chunks = 0;
+    while pos + 2 <= stream.len() {
+        let len = usize::from(stream[pos] & 0x7F) << 8 | usize::from(stream[pos + 1]);
+        let deflated = stream[pos] & 0x80 != 0;
+        if len == 0 || pos + 2 + len > stream.len() {
+            break;
+        }
+        let body = &stream[pos + 2..pos + 2 + len];
+        if deflated {
+            out.extend(miniz_oxide::inflate::decompress_to_vec_with_limit(body, MAX_INFLATED).ok()?);
+        } else {
+            out.extend_from_slice(body);
+        }
+        pos += 2 + len;
+        chunks += 1;
+    }
+    (chunks > 0).then_some((out, pos == stream.len()))
+}
+
+/// Lines that are commands of a Winlink mail session, if the text contains any.
+pub fn winlink_commands(text: &[u8]) -> usize {
+    text.split(|&b| b == b'\r' || b == b'\n')
+        .filter(|l| {
+            l.starts_with(b"[WL2K-") || l.starts_with(b"[RMS ") || l.starts_with(b";PQ:") || l.starts_with(b";PR:") || l.starts_with(b";FW:")
+                || l.starts_with(b"FC EM ") || l.starts_with(b"FS ") || l.starts_with(b"FF") || l.starts_with(b"FQ") || l.starts_with(b"F> ")
+        })
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +144,28 @@ mod tests {
         assert_eq!((p.data.as_deref(), p.full, p.last, p.next_level), (Some(&b"CQ CQ DE TEST"[..]), false, true, Some(3)));
         let p = parse(&build(12, b"", 0x00, None)).unwrap();
         assert_eq!(p.data.as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
+    fn files_compression() {
+        let text = b"The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.";
+        let z = miniz_oxide::deflate::compress_to_vec(text, 6);
+        let mut stream = vec![0x80 | (z.len() >> 8) as u8, z.len() as u8];
+        stream.extend(&z);
+        stream.extend([0x00, 0x03, b'a', b'b', b'c']); // a second chunk, stored
+        let (out, clean) = unpack_files(&stream).unwrap();
+        assert!(clean);
+        assert_eq!(out, [&text[..], b"abc"].concat());
+        // a stream cut in the middle of a chunk gives what is complete so far
+        let (part, clean) = unpack_files(&stream[..stream.len() - 2]).unwrap();
+        assert_eq!((part.len(), clean), (text.len(), false));
+        assert!(unpack_files(&[0x12]).is_none());
+    }
+
+    #[test]
+    fn winlink_lines() {
+        assert_eq!(winlink_commands(b"[WL2K-5.0-B2FWIHJM$]\r;PQ: 12345678\rFC EM ABCDEFGHIJKL 100 80 0\rF> 3A\r"), 4);
+        assert_eq!(winlink_commands(b"HELLO DE TEST\r"), 0);
     }
 
     #[test]

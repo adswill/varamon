@@ -8,3 +8,4 @@ repository.workspace = true
 
 [dependencies]
 rustfft = "6"
+miniz_oxide = "0.8"

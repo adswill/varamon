@@ -83,19 +83,37 @@ fn main() -> ExitCode {
         }
         let stations = found.iter().map(|f| f.station + 1).max().unwrap_or(0);
         for s in 0..stations {
-            let data = scan::stream_of(&found, s);
             let frames = found.iter().filter(|f| f.crc_ok && f.station == s).count();
             if frames == 0 {
                 continue;
             }
             let name = label(s);
-            if data.is_empty() {
+            let runs = scan::stream_of(&found, s);
+            if runs.iter().all(|r| r.1.is_empty()) {
                 println!("station {name}: {frames} frames, no payload");
-            } else if frame::is_text(&data) {
-                println!("station {name}: {frames} frames, {} bytes of text:\n  {}", data.len(), frame::text_of(&data).replace("\\n", "\n  "));
-            } else {
-                let runs = frame::text_runs(&data, 8);
-                println!("station {name}: {frames} frames, {} bytes, not plain text (compressed or binary){}", data.len(), if runs.is_empty() { String::new() } else { format!("; readable pieces: {}", runs.join(" | ")) });
+                continue;
+            }
+            println!("station {name}: {frames} frames");
+            for (compressed, data) in runs.iter().filter(|r| !r.1.is_empty()) {
+                let show = |what: &str, d: &[u8]| {
+                    if frame::is_text(d) {
+                        let wl = frame::winlink_commands(d);
+                        let note = if wl > 0 { format!(", {wl} Winlink session commands") } else { String::new() };
+                        println!("  {what}: {} bytes of text{note}:\n    {}", d.len(), frame::text_of(d).replace("\\n", "\n    "));
+                    } else {
+                        let pieces = frame::text_runs(d, 8);
+                        let extra = if pieces.is_empty() { String::new() } else { format!("; readable pieces: {}", pieces.join(" | ")) };
+                        println!("  {what}: {} bytes, not plain text{extra}", d.len());
+                    }
+                };
+                if !compressed {
+                    show("stream", data);
+                } else {
+                    match frame::unpack_files(data) {
+                        Some((out, clean)) => show(&format!("unpacked from {} compressed bytes{}", data.len(), if clean { "" } else { " (stream cut short)" }), &out),
+                        None => println!("  compressed stream: {} bytes, not unpacked (text-dictionary compression, or the start is missing)", data.len()),
+                    }
+                }
             }
         }
         println!("{} frames, {} decoded with correct CRC; {} control bursts\n", found.len(), found.iter().filter(|f| f.crc_ok).count(), events.len() - found.len());

@@ -356,18 +356,21 @@ pub fn frames(events: &[Event]) -> Vec<&Found> {
     events.iter().filter_map(|e| if let Event::Frame(f) = e { Some(f) } else { None }).collect()
 }
 
-/// The payloads of one station joined in time order. Exact repeats of the previous frame (a
-/// retransmission after a missed acknowledgement) are dropped.
-pub fn stream_of(found: &[&Found], station: usize) -> Vec<u8> {
-    let mut out = Vec::new();
+/// The payloads of one station joined in time order, as runs of (compressed flag, bytes). Exact
+/// repeats of the previous frame (a retransmission after a missed acknowledgement) are dropped.
+pub fn stream_of(found: &[&Found], station: usize) -> Vec<(bool, Vec<u8>)> {
+    let mut out: Vec<(bool, Vec<u8>)> = Vec::new();
     let mut prev: Option<&[u8]> = None;
     for f in found.iter().filter(|f| f.crc_ok && f.station == station) {
         if prev == Some(&f.frame[..]) {
             continue;
         }
         prev = Some(&f.frame[..]);
-        if let Some(data) = crate::frame::parse(&f.frame).and_then(|p| p.data) {
-            out.extend(data);
+        let Some(p) = crate::frame::parse(&f.frame) else { continue };
+        let Some(data) = p.data else { continue };
+        match out.last_mut() {
+            Some(last) if last.0 == p.compressed => last.1.extend(data),
+            _ => out.push((p.compressed, data)),
         }
     }
     out
