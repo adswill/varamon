@@ -173,10 +173,10 @@ fn decode_segment(s: &[f64], tables: &Tables) -> Option<(u32, u32, crate::fsk::D
 }
 
 /// Every burst of at least 0.25 s as (start, end, level in dB), cut at gaps of 0.08 s or more.
-fn bursts(x: &[f64]) -> Vec<(f64, f64, f64)> {
+fn bursts(x: &[f64]) -> (Vec<(f64, f64)>, Vec<f64>) {
     let n = x.len();
     if n < RATE {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let mut planner = FftPlanner::new();
     let mut buf: Vec<Complex64> = x.iter().map(|&v| Complex64::new(v, 0.0)).collect();
@@ -209,15 +209,20 @@ fn bursts(x: &[f64]) -> Vec<(f64, f64, f64)> {
             _ => {}
         }
     }
-    out.into_iter()
-        .filter(|(a, b)| b - a >= 25)
-        .map(|(a, b)| {
-            let mut v = db[a..b].to_vec();
-            v.sort_by(|p, q| q.total_cmp(p));
-            let top = &v[..v.len().div_ceil(2)];
-            (a as f64 * 0.01, b as f64 * 0.01, top.iter().sum::<f64>() / top.len() as f64)
-        })
-        .collect()
+    let list = out.into_iter().filter(|(a, b)| b - a >= 25).map(|(a, b)| (a as f64 * 0.01, b as f64 * 0.01)).collect();
+    (list, db)
+}
+
+/// Level of the stretch from `a` to `b` seconds: the mean of its louder half, in dB.
+fn level_of(db: &[f64], a: f64, b: f64) -> f64 {
+    let (i, j) = (((a * 100.0) as usize).min(db.len()), ((b * 100.0) as usize).min(db.len()));
+    if j <= i {
+        return f64::NEG_INFINITY;
+    }
+    let mut v = db[i..j].to_vec();
+    v.sort_by(|p, q| q.total_cmp(p));
+    let top = &v[..v.len().div_ceil(2)];
+    top.iter().sum::<f64>() / top.len() as f64
 }
 
 /// Work out who sent what from the turn-taking. A link is half duplex: after a station stops, the
@@ -287,7 +292,10 @@ pub fn scan(x: &[f64], tables: &Tables) -> Scan {
     }
     // short bursts that are not part of a frame: acknowledgements and other control signals
     let spans: Vec<(f64, f64)> = events.iter().map(|e| (e.time() - 0.1, e.end() + 0.05)).collect();
-    for (a, b, level_db) in bursts(x) {
+    // anything more than 25 dB below the strongest frame is noise, not a station
+    let floor = events.iter().map(|e| e.level()).fold(f64::NEG_INFINITY, f64::max) - 25.0;
+    let (list, db) = bursts(x);
+    for (a, b) in list {
         let (mut a, mut b) = (a, b);
         // cut away the part covered by a frame
         for &(s, e) in &spans {
@@ -301,7 +309,8 @@ pub fn scan(x: &[f64], tables: &Tables) -> Scan {
                 }
             }
         }
-        if b - a >= 0.25 && b - a < 3.0 {
+        let level_db = level_of(&db, a, b);
+        if b - a >= 0.25 && b - a < 3.0 && level_db >= floor {
             events.push(Event::Control(Control { time: a, seconds: b - a, level_db, station: 0, format: None, code: None }));
         }
     }
@@ -356,10 +365,11 @@ pub fn frames(events: &[Event]) -> Vec<&Found> {
     events.iter().filter_map(|e| if let Event::Frame(f) = e { Some(f) } else { None }).collect()
 }
 
-/// The payloads of one station joined in time order, as runs of (compressed flag, bytes). Exact
-/// repeats of the previous frame (a retransmission after a missed acknowledgement) are dropped.
-pub fn stream_of(found: &[&Found], station: usize) -> Vec<(bool, Vec<u8>)> {
-    let mut out: Vec<(bool, Vec<u8>)> = Vec::new();
+/// The payloads of one station in time order, as runs of (compressed flag, frame payloads).
+/// Exact repeats of the previous frame (a retransmission after a missed acknowledgement) are
+/// dropped.
+pub fn stream_of(found: &[&Found], station: usize) -> Vec<(bool, Vec<Vec<u8>>)> {
+    let mut out: Vec<(bool, Vec<Vec<u8>>)> = Vec::new();
     let mut prev: Option<&[u8]> = None;
     for f in found.iter().filter(|f| f.crc_ok && f.station == station) {
         if prev == Some(&f.frame[..]) {
@@ -368,12 +378,31 @@ pub fn stream_of(found: &[&Found], station: usize) -> Vec<(bool, Vec<u8>)> {
         prev = Some(&f.frame[..]);
         let Some(p) = crate::frame::parse(&f.frame) else { continue };
         let Some(data) = p.data else { continue };
+        if data.is_empty() {
+            continue;
+        }
         match out.last_mut() {
-            Some(last) if last.0 == p.compressed => last.1.extend(data),
-            _ => out.push((p.compressed, data)),
+            Some(last) if last.0 == p.compressed => last.1.push(data),
+            _ => out.push((p.compressed, vec![data])),
         }
     }
     out
+}
+
+/// Undo the modem's compression on a run of compressed frame payloads. Tries the "files" mode on
+/// the joined stream, then the text mode frame by frame. Returns the bytes and the mode's name.
+pub fn unpack(frames: &[Vec<u8>]) -> Option<(Vec<u8>, &'static str)> {
+    let joined: Vec<u8> = frames.concat();
+    if let Some((out, clean)) = crate::frame::unpack_files(&joined) {
+        if clean || !out.is_empty() {
+            return Some((out, "files compression"));
+        }
+    }
+    let mut out = Vec::new();
+    for f in frames {
+        out.extend(crate::textcomp::decompress(f)?);
+    }
+    crate::frame::is_text(&out).then_some((out, "text compression"))
 }
 
 #[cfg(test)]

@@ -69,6 +69,10 @@ fn main() -> ExitCode {
                 None => "payload not terminated".to_string(),
                 Some(d) if d.is_empty() => "empty".to_string(),
                 Some(d) if frame::is_text(d) && !p.compressed => format!("text  \"{}\"", frame::text_of(d)),
+                Some(d) if p.compressed => match varamon_core::textcomp::decompress(d).filter(|t| frame::is_text(t)) {
+                    Some(t) => format!("text  \"{}\"  ({} bytes packed)", frame::text_of(&t), d.len()),
+                    None => format!("data  {} bytes", d.len()),
+                },
                 Some(d) => format!("data  {} bytes", d.len()),
             };
             println!("{head}{content}{}", if flags.is_empty() { String::new() } else { format!("  [{flags}]") });
@@ -89,12 +93,14 @@ fn main() -> ExitCode {
             }
             let name = label(s);
             let runs = scan::stream_of(&found, s);
-            if runs.iter().all(|r| r.1.is_empty()) {
+            if runs.is_empty() {
                 println!("station {name}: {frames} frames, no payload");
                 continue;
             }
             println!("station {name}: {frames} frames");
-            for (compressed, data) in runs.iter().filter(|r| !r.1.is_empty()) {
+            for (compressed, frames_in_run) in &runs {
+                let data: Vec<u8> = frames_in_run.concat();
+                let data = &data;
                 let show = |what: &str, d: &[u8]| {
                     if frame::is_text(d) {
                         let wl = frame::winlink_commands(d);
@@ -109,9 +115,9 @@ fn main() -> ExitCode {
                 if !compressed {
                     show("stream", data);
                 } else {
-                    match frame::unpack_files(data) {
-                        Some((out, clean)) => show(&format!("unpacked from {} compressed bytes{}", data.len(), if clean { "" } else { " (stream cut short)" }), &out),
-                        None => println!("  compressed stream: {} bytes, not unpacked (text-dictionary compression, or the start is missing)", data.len()),
+                    match scan::unpack(frames_in_run) {
+                        Some((out, mode)) => show(&format!("unpacked from {} bytes ({mode})", data.len()), &out),
+                        None => println!("  compressed stream: {} bytes, could not be unpacked (the start may be missing)", data.len()),
                     }
                 }
             }

@@ -10,5 +10,6 @@ pub mod frame;
 pub mod fsk;
 pub mod scan;
 pub mod tables;
+pub mod textcomp;
 pub mod turbo;
 pub mod vb;
