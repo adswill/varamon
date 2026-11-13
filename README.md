@@ -13,6 +13,7 @@ varamon listens to receiver audio, finds each VARA HF transmission, works out it
 - [Output](#output)
 - [How it works](#how-it-works)
 - [Status](#status)
+- [Rust version](#rust-version)
 - [Testing](#testing)
 - [Notes and licence](#notes-and-licence)
 - [Support](#support)
@@ -88,9 +89,29 @@ The web page shows the same list with a details pane, the frame bytes, a waterfa
 
 Frame contents are shown as bytes; compression and higher-layer protocols are not interpreted.
 
+## Rust version
+
+The project is being moved to Rust. The Rust version lives in `rust/` and will replace the Python one once it covers the same ground.
+
+| Part | Python | Rust |
+|---|---|---|
+| Tone-keyed levels, all three bandwidth modes | yes | yes |
+| Phase-keyed levels 5-9, OFDM levels 10-16 | yes | not yet |
+| Command line for recordings | yes | yes |
+| Web page and live audio input | yes | not yet |
+| Rig control through Hamlib | no | not yet |
+
+```
+cd rust
+cargo build --release
+./target/release/varamon recording.wav
+```
+
+On the off-air test recording the Rust version decodes the same frames as the Python version, byte for byte.
+
 ## Testing
 
-`python -m varamon --selftest` generates frames at several levels and bandwidth modes with noise and a tuning offset, scans them and compares. The same test runs on Linux and Windows through GitHub Actions.
+`python -m varamon --selftest` generates frames at several levels and bandwidth modes with noise and a tuning offset, scans them and compares. The same test runs on Linux and Windows through GitHub Actions, together with the Rust tests (`cargo test --release` in `rust/`), which compare the Rust code with values from the Python version.
 
 ## Notes and licence
 

@@ -1,0 +1,10 @@
+[package]
+name = "varamon"
+description = "Receive-only monitor for VARA HF signals"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+varamon-core = { path = "../varamon-core" }

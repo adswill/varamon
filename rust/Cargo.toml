@@ -1,5 +1,5 @@
 [workspace]
-members = ["varamon-core"]
+members = ["varamon-core", "varamon"]
 resolver = "2"
 
 [workspace.package]
