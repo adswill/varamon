@@ -42,14 +42,22 @@ fn main() -> ExitCode {
         };
         let name = Path::new(path).file_name().map_or(path.as_str().into(), |n| n.to_string_lossy());
         println!("{name}: {:.1} s", x.len() as f64 / audio::RATE as f64);
-        let found = scan::scan(&x, &tables, |f| {
-            let station = (b'A' + f.station as u8) as char;
-            let head = format!("{:8.2} s  {:5.2} s  station {station}  {:4} Hz L{:<2} {:5.1} dB  ", f.time, f.seconds, f.mode, f.level, f.level_db);
+        let events = scan::scan(&x, &tables);
+        let label = |s: usize| (b'A' + (s % 26) as u8) as char;
+        for ev in &events {
+            let f = match ev {
+                scan::Event::Control(c) => {
+                    println!("{:8.2} s  {:5.2} s  station {}  control burst ({:.0} dB), not decoded", c.time, c.seconds, label(c.station), c.level_db);
+                    continue;
+                }
+                scan::Event::Frame(f) => f,
+            };
+            let head = format!("{:8.2} s  {:5.2} s  station {}  {:4} Hz L{:<2} ", f.frame_start, f.frame_end - f.frame_start, label(f.station), f.mode, f.level);
             if !f.crc_ok {
                 println!("{head}not decoded (CRC failed, pattern match {:.2})", f.score);
-                return;
+                continue;
             }
-            let Some(p) = frame::parse(&f.frame) else { return };
+            let Some(p) = frame::parse(&f.frame) else { continue };
             let flags = [(p.last, "last"), (p.compressed, "compressed")].iter().filter(|x| x.0).map(|x| x.1).collect::<Vec<_>>().join(", ");
             let content = match &p.data {
                 None => "payload not terminated".to_string(),
@@ -61,12 +69,16 @@ fn main() -> ExitCode {
             if hex {
                 println!("            {}", f.frame.iter().map(|b| format!("{b:02x}")).collect::<String>());
             }
-        });
+        }
+        let found = scan::frames(&events);
         let stations = found.iter().map(|f| f.station + 1).max().unwrap_or(0);
         for s in 0..stations {
             let data = scan::stream_of(&found, s);
             let frames = found.iter().filter(|f| f.crc_ok && f.station == s).count();
-            let name = (b'A' + s as u8) as char;
+            if frames == 0 {
+                continue;
+            }
+            let name = label(s);
             if data.is_empty() {
                 println!("station {name}: {frames} frames, no payload");
             } else if frame::is_text(&data) {
@@ -76,7 +88,7 @@ fn main() -> ExitCode {
                 println!("station {name}: {frames} frames, {} bytes, not plain text (compressed or binary){}", data.len(), if runs.is_empty() { String::new() } else { format!("; readable pieces: {}", runs.join(" | ")) });
             }
         }
-        println!("{} transmissions, {} decoded with correct CRC\n", found.len(), found.iter().filter(|f| f.crc_ok).count());
+        println!("{} frames, {} decoded with correct CRC; {} control bursts\n", found.len(), found.iter().filter(|f| f.crc_ok).count(), events.len() - found.len());
     }
     status
 }
