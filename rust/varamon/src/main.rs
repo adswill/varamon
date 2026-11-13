@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use varamon_core::{audio, frame, scan};
+use varamon_core::{audio, ctrl, frame, scan};
 
 const USAGE: &str = "usage: varamon [--hex] RECORDING.wav ...
 
@@ -42,12 +42,18 @@ fn main() -> ExitCode {
         };
         let name = Path::new(path).file_name().map_or(path.as_str().into(), |n| n.to_string_lossy());
         println!("{name}: {:.1} s", x.len() as f64 / audio::RATE as f64);
-        let events = scan::scan(&x, &tables);
+        let result = scan::scan(&x, &tables);
+        let events = &result.events;
         let label = |s: usize| (b'A' + (s % 26) as u8) as char;
-        for ev in &events {
+        for ev in events {
             let f = match ev {
                 scan::Event::Control(c) => {
-                    println!("{:8.2} s  {:5.2} s  station {}  control burst ({:.0} dB), not decoded", c.time, c.seconds, label(c.station), c.level_db);
+                    let what = match (c.code, c.format) {
+                        (Some((code, hits, total)), _) => format!("{} (code {code}, {hits} of {total} symbols)", ctrl::code_name(code)),
+                        (None, Some(_)) => "control burst, key not found".to_string(),
+                        (None, None) => "short burst, not a control format".to_string(),
+                    };
+                    println!("{:8.2} s  {:5.2} s  station {}  {what}", c.time, c.seconds, label(c.station));
                     continue;
                 }
                 scan::Event::Frame(f) => f,
@@ -70,7 +76,11 @@ fn main() -> ExitCode {
                 println!("            {}", f.frame.iter().map(|b| format!("{b:02x}")).collect::<String>());
             }
         }
-        let found = scan::frames(&events);
+        let found = scan::frames(events);
+        for (st, key) in &result.keys {
+            let (caller, answerer) = key.hashes();
+            println!("station {} key found: callsign hash {caller:06x} if it made the call, {answerer:06x} if it answered", label(*st));
+        }
         let stations = found.iter().map(|f| f.station + 1).max().unwrap_or(0);
         for s in 0..stations {
             let data = scan::stream_of(&found, s);

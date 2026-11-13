@@ -26,6 +26,36 @@ impl VbRnd {
         r
     }
 
+    pub fn from_state(state: u32) -> Self {
+        Self { state: state & MASK }
+    }
+
+    /// The state after `Rnd(-1)`, `Randomize(x mod 32768)` and `x div 32768 + 1` steps: how the
+    /// control codebooks are seeded.
+    pub fn seeded(x: u64) -> Self {
+        let mut r = Self::new();
+        r.reseed();
+        r.randomize((x % 32768) as f64);
+        for _ in 0..=x / 32768 {
+            r.advance();
+        }
+        r
+    }
+
+    /// One step backwards.
+    pub fn retreat(&mut self) {
+        const MUL_INV: u32 = {
+            let mut x: u32 = 0x00FD_43FD;
+            let mut i = 0;
+            while i < 5 {
+                x = x.wrapping_mul(2u32.wrapping_sub(0x00FD_43FDu32.wrapping_mul(x)));
+                i += 1;
+            }
+            x & MASK
+        };
+        self.state = self.state.wrapping_sub(0x00C3_9EC3).wrapping_mul(MUL_INV) & MASK;
+    }
+
     pub fn state(&self) -> u32 {
         self.state
     }
@@ -72,6 +102,14 @@ mod tests {
         r.reseed();
         assert_eq!(r.state(), 0x395886);
         assert_eq!(VbRnd::stream(43.0).state(), 0xC04586);
+    }
+
+    #[test]
+    fn retreat_undoes_advance() {
+        let mut r = VbRnd::from_state(0x123456);
+        r.advance();
+        r.retreat();
+        assert_eq!(r.state(), 0x123456);
     }
 
     #[test]

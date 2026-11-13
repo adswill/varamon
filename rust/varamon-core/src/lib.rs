@@ -5,6 +5,7 @@
 
 pub mod audio;
 pub mod crc;
+pub mod ctrl;
 pub mod frame;
 pub mod fsk;
 pub mod scan;

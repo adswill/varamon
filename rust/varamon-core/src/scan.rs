@@ -52,6 +52,10 @@ pub struct Control {
     pub seconds: f64,
     pub level_db: f64,
     pub station: usize,
+    /// burst format 0, 1 or 2 (31, 15 or 7 code symbols), if the length fits one
+    pub format: Option<usize>,
+    /// (code number, matching symbols, symbols in the code), once the station's key is known
+    pub code: Option<(u32, usize, usize)>,
 }
 
 /// Everything heard, in time order.
@@ -257,7 +261,7 @@ fn assign_stations(events: &mut [Event]) {
 
 /// Scan a recording at 48 kHz. Returns every frame and control burst in time order, with the
 /// sending station worked out from the turn-taking.
-pub fn scan(x: &[f64], tables: &Tables) -> Vec<Event> {
+pub fn scan(x: &[f64], tables: &Tables) -> Scan {
     let mut events = Vec::new();
     for (a, b, level_db) in segments(x) {
         // 2 s margin before and 0.7 s after: a faded start or end is common off air
@@ -298,12 +302,53 @@ pub fn scan(x: &[f64], tables: &Tables) -> Vec<Event> {
             }
         }
         if b - a >= 0.25 && b - a < 3.0 {
-            events.push(Event::Control(Control { time: a, seconds: b - a, level_db, station: 0 }));
+            events.push(Event::Control(Control { time: a, seconds: b - a, level_db, station: 0, format: None, code: None }));
         }
     }
     events.sort_by(|p, q| p.time().total_cmp(&q.time()));
     assign_stations(&mut events);
-    events
+    let keys = decode_control(x, &mut events);
+    Scan { events, keys }
+}
+
+/// The result of a scan.
+pub struct Scan {
+    pub events: Vec<Event>,
+    /// for each station whose control bursts could be resolved: (station, key)
+    pub keys: Vec<(usize, crate::ctrl::Key)>,
+}
+
+/// Measure every control burst, find each station's key from its own bursts and name the codes.
+fn decode_control(x: &[f64], events: &mut [Event]) -> Vec<(usize, crate::ctrl::Key)> {
+    use crate::ctrl;
+    let mut offsets: Vec<f64> = events.iter().filter_map(|e| if let Event::Frame(f) = e { f.crc_ok.then_some(f.offset) } else { None }).collect();
+    offsets.sort_by(|a, b| a.total_cmp(b));
+    let offset = offsets.get(offsets.len() / 2).copied().unwrap_or(0.0);
+    let mut measured: Vec<(usize, usize, ctrl::Measured)> = Vec::new(); // (event index, station, tones)
+    for (i, e) in events.iter_mut().enumerate() {
+        if let Event::Control(c) = e {
+            if let Some(m) = ctrl::measure(x, c.time, c.seconds, offset) {
+                c.format = Some(m.format);
+                measured.push((i, c.station, m));
+            }
+        }
+    }
+    let mut keys = Vec::new();
+    let mut stations: Vec<usize> = measured.iter().map(|m| m.1).collect();
+    stations.sort_unstable();
+    stations.dedup();
+    for st in stations {
+        let own: Vec<ctrl::Measured> = measured.iter().filter(|m| m.1 == st).map(|m| m.2.clone()).collect();
+        if let Some(key) = ctrl::resolve(&own) {
+            keys.push((st, key));
+            for (i, _, m) in measured.iter().filter(|m| m.1 == st) {
+                if let Event::Control(c) = &mut events[*i] {
+                    c.code = ctrl::identify(m, key);
+                }
+            }
+        }
+    }
+    keys
 }
 
 /// The frames among the events.
@@ -333,7 +378,7 @@ mod tests {
     use super::*;
 
     fn ctl(time: f64, seconds: f64, level_db: f64) -> Event {
-        Event::Control(Control { time, seconds, level_db, station: 9 })
+        Event::Control(Control { time, seconds, level_db, station: 9, format: None, code: None })
     }
 
     fn stations(events: &[Event]) -> Vec<usize> {

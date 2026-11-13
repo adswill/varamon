@@ -28,7 +28,9 @@ varamon listens to receiver audio, finds each VARA HF transmission, works out it
 | 500 Hz | 1-3 | tone-keyed |
 | 2750 Hz | 1-4 | tone-keyed |
 
-Not decoded: the higher levels of the 500 and 2750 Hz modes, control and handshake bursts, VARA FM, VARA SAT.
+Control bursts (acknowledgements and similar) of the 2300 Hz mode are decoded by the Rust version, which finds the station's key from the signal.
+
+Not decoded: the higher levels of the 500 and 2750 Hz modes, the connection handshake, VARA FM, VARA SAT.
 
 ## Requirements
 
@@ -99,6 +101,7 @@ The project is being moved to Rust. The Rust version lives in `rust/` and will r
 | Phase-keyed levels 5-9, OFDM levels 10-16 | yes | not yet |
 | Command line for recordings | yes | yes |
 | Payload, stations, joined streams and text display | no | yes |
+| Control bursts (acknowledgements) with automatic key search | no | yes |
 | Web page and live audio input | yes | not yet |
 | Rig control through Hamlib | no | not yet |
 
