@@ -15,6 +15,7 @@ varamon listens to receiver audio, finds each VARA HF transmission, works out it
 - [Status](#status)
 - [Testing](#testing)
 - [Notes and licence](#notes-and-licence)
+- [Support](#support)
 
 ## What it decodes
 
@@ -96,3 +97,9 @@ Frame contents are shown as bytes; compression and higher-layer protocols are no
 varamon is an independent project. It is not affiliated with or endorsed by the author of VARA and contains no code from VARA. It was written from on-air recordings and published descriptions of the signal; see [NOTICE](NOTICE).
 
 MIT licence, see [LICENSE](LICENSE).
+
+## Support
+
+If you would like more projects like this, or want to support this one, consider donating.
+
+[![Support on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/adswill)
