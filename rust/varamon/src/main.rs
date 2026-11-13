@@ -3,13 +3,14 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use varamon_core::{audio, ctrl, frame, scan};
+use varamon_core::{audio, b2f, ctrl, frame, scan};
 
 const USAGE: &str = "usage: varamon [--hex] RECORDING.wav ...
 
 Receive-only monitor for VARA HF signals. Recordings are 16-bit WAV of the receiver's audio in USB.
 
   --hex       also print the bytes of each decoded frame
+  --mail      show the headers and text of mail messages (off by default: they are other people's mail)
   --version   print the version
   --help      print this text";
 
@@ -24,6 +25,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let hex = args.iter().any(|a| a == "--hex");
+    let show_mail = args.iter().any(|a| a == "--mail");
     let files: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     if files.is_empty() {
         eprintln!("{USAGE}");
@@ -97,30 +99,58 @@ fn main() -> ExitCode {
                 println!("station {name}: {frames} frames, no payload");
                 continue;
             }
-            println!("station {name}: {frames} frames");
+            // the application stream: every run, with the modem's own compression undone
+            let mut app: Vec<u8> = Vec::new();
+            let mut notes: Vec<String> = Vec::new();
             for (compressed, frames_in_run) in &runs {
-                let data: Vec<u8> = frames_in_run.concat();
-                let data = &data;
-                let show = |what: &str, d: &[u8]| {
-                    if frame::is_text(d) {
-                        let wl = frame::winlink_commands(d);
-                        let note = if wl > 0 { format!(", {wl} Winlink session commands") } else { String::new() };
-                        println!("  {what}: {} bytes of text{note}:\n    {}", d.len(), frame::text_of(d).replace("\\n", "\n    "));
-                    } else {
-                        let pieces = frame::text_runs(d, 8);
-                        let extra = if pieces.is_empty() { String::new() } else { format!("; readable pieces: {}", pieces.join(" | ")) };
-                        println!("  {what}: {} bytes, not plain text{extra}", d.len());
-                    }
-                };
+                let raw: Vec<u8> = frames_in_run.concat();
                 if !compressed {
-                    show("stream", data);
+                    app.extend(raw);
+                } else if let Some((out, mode)) = scan::unpack(frames_in_run) {
+                    notes.push(format!("{} bytes unpacked to {} ({mode})", raw.len(), out.len()));
+                    app.extend(out);
                 } else {
-                    match scan::unpack(frames_in_run) {
-                        Some((out, mode)) => show(&format!("unpacked from {} bytes ({mode})", data.len()), &out),
-                        None => println!("  compressed stream: {} bytes, could not be unpacked (the start may be missing)", data.len()),
-                    }
+                    notes.push(format!("{} compressed bytes could not be unpacked", raw.len()));
+                    app.extend(raw);
                 }
             }
+            println!("station {name}: {frames} frames, {} bytes{}", app.len(), if notes.is_empty() { String::new() } else { format!("  [{}]", notes.join("; ")) });
+            let show = |d: &[u8]| {
+                if d.is_empty() {
+                } else if frame::is_text(d) || d.iter().all(|&b| (0x20..0x7F).contains(&b) || b == b'\r' || b == b'\n') {
+                    let wl = frame::winlink_commands(d);
+                    let note = if wl > 0 { format!(", {wl} Winlink session commands") } else { String::new() };
+                    println!("  text, {} bytes{note}:\n    {}", d.len(), frame::text_of(d).replace("\\n", "\n    "));
+                } else {
+                    let pieces = frame::text_runs(d, 8);
+                    let extra = if pieces.is_empty() { String::new() } else { format!("; readable pieces: {}", pieces.join(" | ")) };
+                    println!("  {} bytes, not plain text{extra}", d.len());
+                }
+            };
+            let mut at = 0;
+            for t in b2f::find_transfers(&app) {
+                show(&app[at..t.start]);
+                at = t.end;
+                let state = match t.checksum_ok {
+                    Some(true) => "block checksum correct",
+                    Some(false) => "block checksum WRONG",
+                    None => "incomplete",
+                };
+                match b2f::message(&t) {
+                    Ok(m) => {
+                        println!("  Winlink message: {} bytes packed, {} bytes unpacked, {state}, {} header lines, body {} bytes", t.packed.len(), m.size, m.headers.len(), m.body.len());
+                        if show_mail {
+                            println!("    Title: {}", t.title);
+                            for (k, v) in &m.headers {
+                                println!("    {k}: {v}");
+                            }
+                            println!("    ----\n    {}", String::from_utf8_lossy(&m.body).replace("\r\n", "\n").replace('\r', "\n").replace('\n', "\n    "));
+                        }
+                    }
+                    Err(e) => println!("  Winlink message: {} bytes packed, {state}, not unpacked ({e:?})", t.packed.len()),
+                }
+            }
+            show(&app[at..]);
         }
         println!("{} frames, {} decoded with correct CRC; {} control bursts\n", found.len(), found.iter().filter(|f| f.crc_ok).count(), events.len() - found.len());
     }
