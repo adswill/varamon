@@ -135,7 +135,7 @@ On the off-air test recording the Rust version decodes the same frames as the Py
 
 varamon is an independent project. It is not affiliated with or endorsed by the author of VARA and contains no code from VARA. It was written from on-air recordings and published descriptions of the signal. The text-compression table comes from the xara project; see [NOTICE](NOTICE).
 
-MIT licence, see [LICENSE](LICENSE).
+The source is published to be read, built, run and improved through pull requests. It may not be redistributed, copied into other software or published in changed form: see [LICENSE](LICENSE). Versions published before 14 November 2026 were under the MIT licence, which still applies to those versions.
 
 ## Support
 

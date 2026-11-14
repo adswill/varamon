@@ -1,21 +1,57 @@
-MIT License
+varamon Source Licence, version 1.0
 
-Copyright (c) 2026 adswill
+Copyright (c) 2026 adswill. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This is not an open-source licence. The source code is published so that it
+can be read, checked, built, and improved through contributions to this
+project. Nothing else is permitted.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. What you may do
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+   a. Read and study the source code.
+   b. Download, build and run the software for your own use, as it is or with
+      your own changes.
+   c. Change the source code in order to offer the change back to this project
+      (for example as a pull request to https://github.com/adswill/varamon), and keep a
+      copy of the project for that purpose, including a fork on GitHub.
+
+2. What you may not do without written permission from the copyright holder
+
+   a. Distribute, publish, sell, sublicense or otherwise make available the
+      software or any part of it, in source or built form, changed or
+      unchanged, except as far as 1(c) needs it.
+   b. Copy any part of the source code into other software, or publish
+      software derived from it.
+   c. Offer the software, or a service built on it, to others.
+   d. Remove or change this licence or the copyright notices.
+
+3. Contributions
+
+   If you send a change to this project, you grant the copyright holder a
+   perpetual, worldwide, irrevocable, royalty-free licence to use, change,
+   distribute and relicense it as part of the project.
+
+4. Ending
+
+   Your permissions under this licence end at once if you break its terms.
+
+5. Third-party material
+
+   The parts listed in the NOTICE file come from other projects and stay under
+   their own licences.
+
+6. Earlier versions
+
+   Versions of this project published before 14 November 2026 were released
+   under the MIT licence. That licence still applies to those versions; this
+   licence applies to everything published from that day on.
+
+7. No warranty
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+   WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
+   OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
