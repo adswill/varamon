@@ -2,9 +2,15 @@
 
 use std::io::Read;
 
-use varamon_core::{audio, scan};
+use varamon_core::{audio, fmscan, scan};
 
-use crate::Printer;
+use crate::{FmPrinter, Printer};
+
+/// What the listener decodes: VARA HF or VARA FM. Each keeps what it learned about the link.
+enum Decoder {
+    Hf { tables: scan::Tables, memory: scan::Memory, printer: Printer },
+    Fm { tables: Box<fmscan::FmTables>, link: fmscan::Link, printer: FmPrinter, told_key: bool },
+}
 
 /// Collects live audio and scans it stretch by stretch.
 pub struct Listener {
@@ -14,9 +20,7 @@ pub struct Listener {
     before: usize,
     checked: usize,
     floor: f64,
-    tables: scan::Tables,
-    memory: scan::Memory,
-    printer: Printer,
+    decoder: Decoder,
 }
 
 /// Loudness of each twentieth of a second.
@@ -25,8 +29,14 @@ fn blocks(x: &[f64], rate: usize) -> Vec<f64> {
 }
 
 impl Listener {
-    pub fn new(rate: usize, calls: &[String], hex: bool) -> Self {
-        Self { rate, buf: Vec::new(), before: 0, checked: 0, floor: f64::MAX, tables: scan::Tables::new(), memory: scan::Memory { calls: calls.to_vec(), ..Default::default() }, printer: Printer::new(hex, true) }
+    pub fn new(rate: usize, calls: &[String], hex: bool, fm: bool) -> Self {
+        let decoder = if fm {
+            let link = fmscan::Link { calls: calls.iter().map(|c| c.to_uppercase()).collect(), ..Default::default() };
+            Decoder::Fm { tables: Box::new(fmscan::FmTables::new()), link, printer: FmPrinter::new(hex, true), told_key: false }
+        } else {
+            Decoder::Hf { tables: scan::Tables::new(), memory: scan::Memory { calls: calls.to_vec(), ..Default::default() }, printer: Printer::new(hex, true) }
+        };
+        Self { rate, buf: Vec::new(), before: 0, checked: 0, floor: f64::MAX, decoder }
     }
 
     /// Add audio. A stretch is scanned once the signal has paused for 0.8 s, or after 25 s.
@@ -98,9 +108,24 @@ impl Listener {
             eprintln!("scan {:.1} s to {:.1} s", self.before as f64 / self.rate as f64, (self.before + upto) as f64 / self.rate as f64);
         }
         let x = audio::to_48k(&self.buf[..upto], self.rate);
-        let result = scan::scan_live(&x, &self.tables, &mut self.memory);
-        self.printer.base = self.before as f64 / self.rate as f64;
-        self.printer.print(&result.events);
+        let base = self.before as f64 / self.rate as f64;
+        match &mut self.decoder {
+            Decoder::Hf { tables, memory, printer } => {
+                let result = scan::scan_live(&x, tables, memory);
+                printer.base = base;
+                printer.print(&result.events);
+            }
+            Decoder::Fm { tables, link, printer, told_key } => {
+                let events = fmscan::scan_with(&x, tables, link);
+                printer.base = base;
+                printer.print(&events, link);
+                // say once how the data frames' key was found
+                if !*told_key && link.called.is_some() {
+                    println!("{}", printer.link_line(link));
+                    *told_key = true;
+                }
+            }
+        }
         let cut = upto.saturating_sub(keep);
         self.buf.drain(..cut);
         self.before += cut;
@@ -109,8 +134,8 @@ impl Listener {
 }
 
 /// Listen to raw audio on standard input: 16-bit little-endian, one channel, `rate` samples a second.
-pub fn from_stdin(rate: usize, calls: &[String], hex: bool) -> std::io::Result<()> {
-    let mut listener = Listener::new(rate, calls, hex);
+pub fn from_stdin(rate: usize, calls: &[String], hex: bool, fm: bool) -> std::io::Result<()> {
+    let mut listener = Listener::new(rate, calls, hex, fm);
     let mut input = std::io::stdin().lock();
     let mut bytes = vec![0u8; rate / 5 * 2];
     loop {
@@ -145,7 +170,7 @@ mod device {
 
     /// Listen to a sound input until the program is stopped. `name` picks the first input whose
     /// name contains it; without it the system's default input is used.
-    pub fn listen(name: Option<&str>, calls: &[String], hex: bool) -> Result<(), String> {
+    pub fn listen(name: Option<&str>, calls: &[String], hex: bool, fm: bool) -> Result<(), String> {
         let host = cpal::default_host();
         let device = match name {
             Some(n) => host
@@ -177,8 +202,8 @@ mod device {
         }
         .map_err(|e| e.to_string())?;
         stream.play().map_err(|e| e.to_string())?;
-        println!("listening to \"{}\" at {rate} Hz; stop with Ctrl-C", device.name().unwrap_or_default());
-        let mut listener = Listener::new(rate, calls, hex);
+        println!("listening to \"{}\" at {rate} Hz for VARA {}; stop with Ctrl-C", device.name().unwrap_or_default(), if fm { "FM" } else { "HF" });
+        let mut listener = Listener::new(rate, calls, hex, fm);
         for block in rx {
             listener.feed(&block);
         }

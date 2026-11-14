@@ -9,8 +9,8 @@ use varamon_core::levels::Bandwidth;
 use varamon_core::{audio, b2f, ctrl, fm, fmscan, frame, scan, synth};
 
 const USAGE: &str = "usage: varamon [--fm] [--hex] [--mail] [--call CALLSIGN] RECORDING.wav ...
-       varamon --live [NAME]
-       varamon --stdin RATE
+       varamon [--fm] --live [NAME]
+       varamon [--fm] --stdin RATE
 
 Receive-only monitor for VARA HF signals. Recordings are 16-bit WAV of the receiver's audio in USB.
 
@@ -20,7 +20,7 @@ Receive-only monitor for VARA HF signals. Recordings are 16-bit WAV of the recei
   --live [NAME]     listen to a sound input (the default one, or the first whose name contains NAME)
   --devices   list the sound inputs
   --stdin RATE      listen to raw audio on standard input: 16-bit, one channel, RATE samples a second
-  --fm        the recordings are VARA FM (default: VARA HF)
+  --fm        the recordings or the live audio are VARA FM (default: VARA HF)
   --selftest  generate a test signal for every level of every bandwidth mode and decode it
   --version   print the version
   --help      print this text";
@@ -41,6 +41,7 @@ fn main() -> ExitCode {
         return if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE };
     }
     let hex = args.iter().any(|a| a == "--hex");
+    let fm_mode = args.iter().any(|a| a == "--fm");
     let show_mail = args.iter().any(|a| a == "--mail");
     let calls: Vec<String> = args.windows(2).filter(|w| w[0] == "--call").map(|w| w[1].clone()).collect();
     let value_of = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).filter(|v| !v.starts_with("--"));
@@ -49,7 +50,7 @@ fn main() -> ExitCode {
             eprintln!("--stdin needs the sample rate, for example --stdin 48000");
             return ExitCode::from(2);
         };
-        return match live::from_stdin(rate, &calls, hex) {
+        return match live::from_stdin(rate, &calls, hex, fm_mode) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("standard input: {e}");
@@ -66,7 +67,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         if args.iter().any(|a| a == "--live") {
-            return match live::listen(value_of("--live").map(|s| s.as_str()), &calls, hex) {
+            return match live::listen(value_of("--live").map(|s| s.as_str()), &calls, hex, fm_mode) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("{e}");
@@ -355,67 +356,110 @@ fn selftest() -> bool {
     all_ok
 }
 
+/// Prints VARA FM events. Remembers the connect frame, so later transmissions can be named.
+pub(crate) struct FmPrinter {
+    hex: bool,
+    /// live mode: times are clock-style from the start of listening; stations are not labelled
+    live: bool,
+    /// seconds before the audio the events' times refer to
+    pub(crate) base: f64,
+    connect: Option<(usize, fm::Connect)>,
+}
+
+impl FmPrinter {
+    pub(crate) fn new(hex: bool, live: bool) -> Self {
+        Self { hex, live, base: 0.0, connect: None }
+    }
+
+    fn when(&self, t: f64) -> String {
+        let t = self.base + t;
+        if self.live {
+            format!("{:02}:{:02}:{:04.1}", (t / 3600.0) as u32, (t / 60.0) as u32 % 60, t % 60.0)
+        } else {
+            format!("{t:8.2} s")
+        }
+    }
+
+    fn who(&self, st: usize) -> String {
+        if self.live {
+            return String::new();
+        }
+        let name = match &self.connect {
+            Some((s, c)) if *s == st => c.source.clone(),
+            Some((_, c)) => c.target.clone(),
+            None => format!("station {}", (b'A' + st as u8) as char),
+        };
+        format!("{name:<10}  ")
+    }
+
+    pub(crate) fn print(&mut self, events: &[fmscan::FmEvent], link: &fmscan::Link) {
+        // the station that sent the connect frame is the caller
+        if let Some(c) = events.iter().find_map(|e| match e {
+            fmscan::FmEvent::Frame(f) if f.rec == 0 && f.crc_ok => fm::connect(&f.frame).map(|c| (f.station, c)),
+            _ => None,
+        }) {
+            self.connect = Some(c);
+        }
+        for ev in events {
+            match ev {
+                fmscan::FmEvent::Tone(t) => {
+                    let what = match t.code {
+                        // without the connect frame the caller's hash, and so narrow or wide reply, is not certain
+                        Some((c @ (23 | 24), hits)) if self.connect.is_none() => format!("CONNECT REPLY (code {c}, {hits} of 10 symbols)"),
+                        Some((c, hits)) => format!("{} (code {c}, {hits} of 10 symbols)", fm::code_name(c)),
+                        None => "tone burst, link not known".to_string(),
+                    };
+                    println!("{}  {:5.2} s  {}{what}", self.when(t.time), t.seconds, self.who(t.station));
+                }
+                fmscan::FmEvent::Frame(f) => {
+                    let l = f.mode.records()[f.rec];
+                    let head = format!("{}  {:5.2} s  {}{} record {:<2} ({}, {})  ", self.when(f.time), f.seconds, self.who(f.station), f.mode.name(), f.rec, fm::record_name(f.rec), l.describe());
+                    if !f.crc_ok {
+                        println!("{head}not decoded (CRC failed, pattern match {:.2})", f.score);
+                        continue;
+                    }
+                    if let Some(c) = fm::connect(&f.frame).filter(|_| f.rec == 0) {
+                        let via: Vec<&str> = [c.via1.as_str(), c.via2.as_str()].into_iter().filter(|v| !v.is_empty()).collect();
+                        println!("{head}{} calls {}{}, {} mode{}", c.source, c.target, if via.is_empty() { String::new() } else { format!(" via {}", via.join(", ")) },
+                            if c.wide { "wide" } else { "narrow" }, if c.registered { ", registered" } else { "" });
+                    } else if let Some(d) = fm::data(f.rec, &f.frame, link.relayed) {
+                        let flags: Vec<&str> = [(d.last, "last"), (d.compressed, "compressed")].iter().filter(|x| x.0).map(|x| x.1).collect();
+                        let content = if d.data.is_empty() {
+                            "empty".to_string()
+                        } else if frame::is_text(&d.data) && !d.compressed {
+                            format!("text  \"{}\"", frame::text_of(&d.data))
+                        } else {
+                            format!("data  {} bytes", d.data.len())
+                        };
+                        println!("{head}{content}{}", if flags.is_empty() { String::new() } else { format!("  [{}]", flags.join(", ")) });
+                    }
+                    if self.hex {
+                        println!("            {}", f.frame.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                    }
+                }
+            }
+        }
+    }
+
+    /// One line on how the data frames' key was found.
+    pub(crate) fn link_line(&self, link: &fmscan::Link) -> String {
+        match (&self.connect, link.called) {
+            (Some((_, c)), _) => format!("link: {} calls {}, {} mode; the key comes from the connect frame", c.source, c.target, if c.wide { "wide" } else { "narrow" }),
+            (None, Some(k)) => format!("link: {} mode; key {k:06x} (callsign hash of the called station) found from {}", link.mode.map_or("unknown", |m| m.name()), link.key_from),
+            (None, None) => "link: key not found; give a callsign with --call to decode the data frames".to_string(),
+        }
+    }
+}
+
 /// Decode one VARA FM recording and print what was sent.
 fn fm_file(path: &str, x: &[f64], tabs: &mut fmscan::FmTables, calls: &[String], hex: bool) {
     let name = Path::new(path).file_name().map_or(path.into(), |n| n.to_string_lossy());
     println!("{name}: {:.1} s, VARA FM", x.len() as f64 / audio::RATE as f64);
     let r = fmscan::scan(x, tabs, calls);
-    // the station that sent the connect frame is the caller
-    let connect = r.events.iter().find_map(|e| match e {
-        fmscan::FmEvent::Frame(f) if f.rec == 0 && f.crc_ok => fm::connect(&f.frame).map(|c| (f.station, c)),
-        _ => None,
-    });
-    let who = |st: usize| -> String {
-        match &connect {
-            Some((s, c)) if *s == st => c.source.clone(),
-            Some((_, c)) => c.target.clone(),
-            None => format!("station {}", (b'A' + st as u8) as char),
-        }
-    };
-    for ev in &r.events {
-        match ev {
-            fmscan::FmEvent::Tone(t) => {
-                let what = match t.code {
-                    // without the connect frame the caller's hash, and so narrow or wide reply, is not certain
-                    Some((c @ (23 | 24), hits)) if connect.is_none() => format!("CONNECT REPLY (code {c}, {hits} of 10 symbols)"),
-                    Some((c, hits)) => format!("{} (code {c}, {hits} of 10 symbols)", fm::code_name(c)),
-                    None => "tone burst, link not known".to_string(),
-                };
-                println!("{:8.2} s  {:5.2} s  {:<10}  {what}", t.time, t.seconds, who(t.station));
-            }
-            fmscan::FmEvent::Frame(f) => {
-                let l = f.mode.records()[f.rec];
-                let head = format!("{:8.2} s  {:5.2} s  {:<10}  {} record {:<2} ({}, {})  ", f.time, f.seconds, who(f.station), f.mode.name(), f.rec, fm::record_name(f.rec), l.describe());
-                if !f.crc_ok {
-                    println!("{head}not decoded (CRC failed, pattern match {:.2})", f.score);
-                    continue;
-                }
-                if let Some(c) = fm::connect(&f.frame).filter(|_| f.rec == 0) {
-                    let via: Vec<&str> = [c.via1.as_str(), c.via2.as_str()].into_iter().filter(|v| !v.is_empty()).collect();
-                    println!("{head}{} calls {}{}, {} mode{}", c.source, c.target, if via.is_empty() { String::new() } else { format!(" via {}", via.join(", ")) },
-                        if c.wide { "wide" } else { "narrow" }, if c.registered { ", registered" } else { "" });
-                } else if let Some(d) = fm::data(f.rec, &f.frame, r.link.relayed) {
-                    let flags: Vec<&str> = [(d.last, "last"), (d.compressed, "compressed")].iter().filter(|x| x.0).map(|x| x.1).collect();
-                    let content = if d.data.is_empty() {
-                        "empty".to_string()
-                    } else if frame::is_text(&d.data) && !d.compressed {
-                        format!("text  \"{}\"", frame::text_of(&d.data))
-                    } else {
-                        format!("data  {} bytes", d.data.len())
-                    };
-                    println!("{head}{content}{}", if flags.is_empty() { String::new() } else { format!("  [{}]", flags.join(", ")) });
-                }
-                if hex {
-                    println!("            {}", f.frame.iter().map(|b| format!("{b:02x}")).collect::<String>());
-                }
-            }
-        }
-    }
-    match (&connect, r.link.called) {
-        (Some((_, c)), _) => println!("link: {} calls {}, {} mode; the key comes from the connect frame", c.source, c.target, if c.wide { "wide" } else { "narrow" }),
-        (None, Some(k)) => println!("link: {} mode; key {k:06x} (callsign hash of the called station) found from {}", r.link.mode.map_or("unknown", |m| m.name()), r.link.key_from),
-        (None, None) => println!("link: key not found; give a callsign with --call to decode the data frames"),
-    }
+    let mut printer = FmPrinter::new(hex, false);
+    printer.print(&r.events, &r.link);
+    println!("{}", printer.link_line(&r.link));
+    let who = |st: usize| printer.who(st).trim_end().to_string();
     // each station's data, joined in time order
     let frames: Vec<&fmscan::FmFrame> = r.events.iter().filter_map(|e| if let fmscan::FmEvent::Frame(f) = e { Some(f) } else { None }).collect();
     for st in 0..2 {

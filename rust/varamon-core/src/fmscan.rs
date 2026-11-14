@@ -164,7 +164,9 @@ fn bursts(x: &[f64]) -> Vec<(usize, usize)> {
     let mut sorted = db.clone();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let top = sorted[sorted.len() * 99 / 100];
-    let threshold = (sorted[sorted.len() / 10] + 10.0).max(top - 30.0);
+    // the noise level is the quietest 2%: a live stretch may be almost all signal. The threshold
+    // stays at least 6 dB under the loud blocks, so a stretch without any pause is still found
+    let threshold = (sorted[sorted.len() / 50] + 10.0).max(top - 30.0).min(top - 6.0);
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut start = None;
     for (i, &v) in db.iter().chain(std::iter::once(&f64::MIN)).enumerate() {
@@ -514,8 +516,14 @@ fn decode_ofdm(s: &[f64], tabs: &mut FmTables, link: &Link) -> Vec<Hit> {
 
 /// Scan a recording at 48 kHz. `calls` are callsigns the listener knows.
 pub fn scan(x: &[f64], tabs: &mut FmTables, calls: &[String]) -> FmScan {
-    let debug = std::env::var_os("VARAMON_DEBUG").is_some();
     let mut link = Link { calls: calls.iter().map(|c| c.to_uppercase()).collect(), ..Link::default() };
+    let events = scan_with(x, tabs, &mut link);
+    FmScan { events, link }
+}
+
+/// Scan one stretch of live audio, starting from what earlier stretches found out about the link.
+pub fn scan_with(x: &[f64], tabs: &mut FmTables, link: &mut Link) -> Vec<FmEvent> {
+    let debug = std::env::var_os("VARAMON_DEBUG").is_some();
     let pieces: Vec<(usize, usize)> = bursts(x);
     // first: which pieces are tone bursts, and their tones
     let mut kinds: Vec<Option<Vec<Tones>>> = Vec::new();
@@ -644,7 +652,7 @@ pub fn scan(x: &[f64], tabs: &mut FmTables, calls: &[String]) -> FmScan {
     }
     events.sort_by(|p, q| p.time().total_cmp(&q.time()));
     assign_stations(&mut events);
-    FmScan { events, link }
+    events
 }
 
 /// Half duplex: a transmission that follows the previous one within 0.6 s is the other station's;
@@ -758,5 +766,38 @@ mod tests {
                 assert_eq!(r.link.calls, [caller.to_string(), called.to_string()]);
             }
         }
+    }
+
+    #[test]
+    fn live_stretches_share_the_key() {
+        // the connect frame in one stretch, the data in the next: the key is carried over
+        let mut tabs = FmTables::new();
+        let (caller, called) = ("N0CALL", "N1CALL-2");
+        let (hc, hd) = (call_hash(caller), call_hash(called));
+        let book = fm::codebook(hd, hc);
+        let narrow = fm::Mode::Narrow;
+        let mut x: Vec<f64> = vec![0.0; RATE / 2];
+        let push = |audio: Vec<f64>, x: &mut Vec<f64>| {
+            x.extend(audio.iter().map(|v| v * 0.8));
+            x.extend(std::iter::repeat(0.0).take(RATE / 5));
+        };
+        push(fm::transmission(narrow, &tabs.narrow, 0, 0, &[&connect_frame(caller, called, false)], 21, 0.0, &mut lcg(1)), &mut x);
+        push(fm::tone_audio(&book[22], 8, 0.0), &mut x);
+        let cut = x.len() - RATE / 10;
+        let mut sent = Vec::new();
+        for (i, rec) in [3usize, 8].into_iter().enumerate() {
+            let f = data_frame(narrow.records()[rec].frame_bytes(), format!("message {i}").as_bytes());
+            push(fm::transmission(narrow, &tabs.narrow, rec, hd, &[&f], 1, 0.0, &mut lcg(20 + i as u32)), &mut x);
+            sent.push((rec, f));
+        }
+        let x = crate::synth::on_air(&x, 0.5, 0.2, 0.0, 0.003, 9);
+        let mut link = Link::default();
+        let first = scan_with(&x[..cut], &mut tabs, &mut link);
+        assert!(first.iter().any(|e| matches!(e, FmEvent::Frame(f) if f.rec == 0 && f.crc_ok)));
+        assert_eq!(link.called, Some(hd));
+        let second = scan_with(&x[cut..], &mut tabs, &mut link);
+        let got: Vec<(usize, Vec<u8>)> = second.iter().filter_map(|e| if let FmEvent::Frame(f) = e { f.crc_ok.then(|| (f.rec, f.frame.clone())) } else { None }).collect();
+        let summary: Vec<(usize, bool, f32)> = second.iter().filter_map(|e| if let FmEvent::Frame(f) = e { Some((f.rec, f.crc_ok, f.score as f32)) } else { None }).collect();
+        assert!(got == sent, "{summary:?} key {:?}", link.called);
     }
 }

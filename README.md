@@ -85,6 +85,7 @@ or run it from the folder without installing: `pip install numpy`, then `python 
 | `varamon --fm recording.wav` | Rust version: decode a VARA FM recording |
 | `varamon --live` | Rust version: listen to the default sound input (`--live NAME` picks one, `--devices` lists them) |
 | `sox -d -t raw -r 48000 -e signed -b 16 -c 1 - \| varamon --stdin 48000` | Rust version: listen to audio piped in as raw 16-bit samples |
+| `varamon --fm --live` | Rust version: listen for VARA FM instead of VARA HF (works with `--stdin` too) |
 
 Recordings are 16-bit WAV of the receiver's audio in USB, at any sample rate. The first run prepares its tables, which takes about a minute; they are cached in `~/.varamon`. On Windows use `py` instead of `python`.
 
@@ -138,7 +139,7 @@ cargo build --release
 ./target/release/varamon --live
 ```
 
-In live mode the audio is cut at the pauses between transmissions and each stretch is decoded as soon as it ends. Callsigns and keys found earlier are remembered, so later bursts are named at once. On Linux the sound input needs the ALSA development files to build (`libasound2-dev`); `cargo build --release --no-default-features` builds without sound input.
+In live mode the audio is cut at the pauses between transmissions and each stretch is decoded as soon as it ends. Callsigns and keys found earlier are remembered, so later bursts are named at once. With `--fm` the same holds for VARA FM: once the connect frame or the tone bursts have given the link's key, every later data frame is decoded with it, even if listening began after the connect. On Linux the sound input needs the ALSA development files to build (`libasound2-dev`); `cargo build --release --no-default-features` builds without sound input.
 
 On the off-air test recording the Rust version decodes the same frames as the Python version, byte for byte.
 
