@@ -41,7 +41,7 @@ A connect request names the called station only by a 24-bit number made from its
 
 - CQ frames (who is calling, and the mode they listen in) and unconnected text messages, with their fragments joined.
 
-Not decoded yet: unconnected AX.25 packets (they are recognised, their packed form is not unpacked), a short special frame sent on its own, VARA FM, VARA SAT. The Python version covers the 2300 Hz mode and the tone-keyed levels of the other two.
+Not decoded: unconnected AX.25 packets (they are recognised, their packed form is not unpacked), a short special frame sent on its own, VARA FM, VARA SAT. The Python version covers the 2300 Hz mode and the tone-keyed levels of the other two.
 
 ## Requirements
 
@@ -113,25 +113,7 @@ The Rust version joins each station's frames, shows text, unpacks both of the mo
 
 ## Rust version
 
-The project is being moved to Rust. The Rust version lives in `rust/` and will replace the Python one once it covers the same ground.
-
-| Part | Python | Rust |
-|---|---|---|
-| Tone-keyed levels, all three bandwidth modes | yes | yes |
-| Phase-keyed and OFDM levels, 2300 Hz mode | yes | yes |
-| Phase-keyed and OFDM levels, 500 and 2750 Hz modes | no | yes |
-| Special frame types, several frames per transmission | no | yes |
-| Callsign from the header frame | no | yes |
-| Command line for recordings | yes | yes |
-| Payload, stations, joined streams and text display | no | yes |
-| Control bursts: all 58 codes, automatic key search, connect requests | no | yes |
-| Unpacking the modem's "files" and text compression | no | yes |
-| Winlink mail transfers (B2F blocks, LZHUF) | no | yes |
-| Self-test over every record of every mode | 4 levels | all 51 |
-| Live audio input (sound device, or audio piped in) | yes | yes |
-| CQ frames and unconnected text messages | no | yes |
-| Web page | yes | not yet |
-| Rig control through Hamlib | no | not yet |
+The Rust version lives in `rust/`.
 
 ```
 cd rust
