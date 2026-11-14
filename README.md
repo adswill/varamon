@@ -39,7 +39,9 @@ The bandwidth mode and level are worked out from the signal; nothing has to be s
 
 A connect request names the called station only by a 24-bit number made from its callsign. varamon shows the callsign when it hears that station's header frame, or when you give it with `--call CALLSIGN`.
 
-Not decoded yet: unconnected (broadcast) frames, a short special frame sent on its own, VARA FM, VARA SAT. The Python version covers the 2300 Hz mode and the tone-keyed levels of the other two.
+- CQ frames (who is calling, and the mode they listen in) and unconnected text messages, with their fragments joined.
+
+Not decoded yet: unconnected AX.25 packets (they are recognised, their packed form is not unpacked), a short special frame sent on its own, VARA FM, VARA SAT. The Python version covers the 2300 Hz mode and the tone-keyed levels of the other two.
 
 ## Requirements
 
@@ -68,6 +70,8 @@ or run it from the folder without installing: `pip install numpy`, then `python 
 | `python -m varamon --selftest` | decodes generated test signals |
 | `python -m varamon --help` | all options |
 | `varamon --call N0CALL recording.wav` | Rust version: name calls to a callsign you know |
+| `varamon --live` | Rust version: listen to the default sound input (`--live NAME` picks one, `--devices` lists them) |
+| `sox -d -t raw -r 48000 -e signed -b 16 -c 1 - \| varamon --stdin 48000` | Rust version: listen to audio piped in as raw 16-bit samples |
 
 Recordings are 16-bit WAV of the receiver's audio in USB, at any sample rate. The first run prepares its tables, which takes about a minute; they are cached in `~/.varamon`. On Windows use `py` instead of `python`.
 
@@ -124,7 +128,9 @@ The project is being moved to Rust. The Rust version lives in `rust/` and will r
 | Unpacking the modem's "files" and text compression | no | yes |
 | Winlink mail transfers (B2F blocks, LZHUF) | no | yes |
 | Self-test over every record of every mode | 4 levels | all 51 |
-| Web page and live audio input | yes | not yet |
+| Live audio input (sound device, or audio piped in) | yes | yes |
+| CQ frames and unconnected text messages | no | yes |
+| Web page | yes | not yet |
 | Rig control through Hamlib | no | not yet |
 
 ```
@@ -132,7 +138,10 @@ cd rust
 cargo build --release
 ./target/release/varamon recording.wav
 ./target/release/varamon --selftest
+./target/release/varamon --live
 ```
+
+In live mode the audio is cut at the pauses between transmissions and each stretch is decoded as soon as it ends. Callsigns and keys found earlier are remembered, so later bursts are named at once. On Linux the sound input needs the ALSA development files to build (`libasound2-dev`); `cargo build --release --no-default-features` builds without sound input.
 
 On the off-air test recording the Rust version decodes the same frames as the Python version, byte for byte.
 

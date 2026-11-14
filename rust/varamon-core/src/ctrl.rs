@@ -360,6 +360,15 @@ fn close_enough(hits: usize, total: usize) -> bool {
 /// Find the key of a station from its control bursts. Needs single-tone bursts (formats 0 and 1)
 /// that differ from each other and come from the same seed. `bw` is the link's mode.
 pub fn resolve(bursts: &[Measured], bw: Bandwidth) -> Option<Key> {
+    match resolve_all(bursts, bw)[..] {
+        [key] => Some(key),
+        _ => None,
+    }
+}
+
+/// Every key that at least two different single-tone bursts agree on. Bursts of several stations
+/// may be mixed: each station's bursts agree only among themselves.
+pub fn resolve_all(bursts: &[Measured], bw: Bandwidth) -> Vec<Key> {
     let mut distinct: Vec<&Measured> = Vec::new();
     for b in bursts.iter().filter(|b| b.format < 2 && b.purity > 0.5) {
         if !distinct.iter().any(|d| d.format == b.format && d.tones == b.tones) {
@@ -367,7 +376,7 @@ pub fn resolve(bursts: &[Measured], bw: Bandwidth) -> Option<Key> {
         }
     }
     if distinct.len() < 2 {
-        return None;
+        return Vec::new();
     }
     let index = seed_index();
     // every seed argument from which one of the first 25 codes of a stream comes out as the burst
@@ -392,24 +401,33 @@ pub fn resolve(bursts: &[Measured], bw: Bandwidth) -> Option<Key> {
             seen
         })
         .collect();
+    // candidates: (bursts that agree, key)
+    let mut cands: Vec<(Vec<usize>, Key)> = Vec::new();
     for steps in FORMAT_STEPS {
-        let mut votes: HashMap<u32, usize> = HashMap::new();
-        for (b, seen) in distinct.iter().zip(&starts) {
+        let mut votes: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, (b, seen)) in distinct.iter().zip(&starts).enumerate() {
             let mut bases: Vec<u32> = seen.iter().map(|&x| u64::from(x).wrapping_sub(steps[b.format]) as u32).collect();
+            bases.sort_unstable();
             bases.dedup();
             for base in bases {
-                *votes.entry(base).or_default() += 1;
+                votes.entry(base).or_default().push(i);
             }
         }
-        if let Some((&base, &n)) = votes.iter().max_by_key(|(_, &n)| n) {
-            // bursts from other streams (connect requests, BREAK, IDLE) vote for nothing in common,
-            // so two bursts that agree are enough; a chance agreement is one in millions
-            if n >= 2 && votes.values().filter(|&&v| v == n).count() == 1 {
-                return Some(Key { base, steps });
-            }
+        // bursts from other streams (connect requests, BREAK, IDLE) vote for nothing in common, so
+        // two bursts that agree are enough; a chance agreement is one in millions
+        cands.extend(votes.into_iter().filter(|(_, v)| v.len() >= 2).map(|(base, v)| (v, Key { base, steps })));
+    }
+    // The same bursts also agree on shifted copies of their stream (a seed 32768 lower starts
+    // one step later) and, if they share a format, under either step rule. The real key is the
+    // one most bursts agree on; among equals, the published step rule and the highest seed.
+    cands.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then((a.1.steps != FORMAT_STEPS[0]).cmp(&(b.1.steps != FORMAT_STEPS[0]))).then(b.1.base.cmp(&a.1.base)));
+    let mut keys: Vec<(Vec<usize>, Key)> = Vec::new();
+    for (voters, key) in cands {
+        if !keys.iter().any(|(v, _)| voters.iter().all(|i| v.contains(i))) {
+            keys.push((voters, key));
         }
     }
-    None
+    keys.into_iter().map(|k| k.1).collect()
 }
 
 /// Which code a burst is, given the key: (code number, symbols that match, symbols in the code).

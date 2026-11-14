@@ -66,6 +66,8 @@ pub struct Control {
     pub code: Option<(u32, usize, usize)>,
     /// what the burst is when the key does not explain it: a connect request, BREAK, IDLE, CQ ...
     pub other: Option<String>,
+    /// the code number if the burst announces unconnected traffic: 48 = CQ, 45, 47, 58 = a message
+    pub announces: Option<u32>,
 }
 
 /// Everything heard, in time order.
@@ -282,6 +284,40 @@ fn grids<'a>(tables: &'a Tables, bw: Bandwidth, psk: bool) -> impl Iterator<Item
     })
 }
 
+/// Average power spectrum of a slice in bins of 11.7 Hz (4096-point transforms, half overlapped).
+fn spectrum(s: &[f64]) -> Vec<f64> {
+    const N: usize = 4096;
+    let fft = FftPlanner::new().plan_fft_forward(N);
+    let window: Vec<f64> = (0..N).map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / N as f64).cos()).collect();
+    let mut p = vec![0.0; N / 8]; // up to 6 kHz
+    let mut at = 0;
+    while at + N <= s.len() {
+        let mut buf: Vec<Complex64> = s[at..at + N].iter().zip(&window).map(|(&v, &w)| Complex64::new(v * w, 0.0)).collect();
+        fft.process(&mut buf);
+        for (acc, v) in p.iter_mut().zip(&buf) {
+            *acc += v.norm_sqr();
+        }
+        at += N / 2;
+    }
+    p
+}
+
+/// How well the spectrum fits a set of carriers, each about 100 Hz wide: 0..1.
+fn carrier_fit(p: &[f64], carriers: &[u32]) -> f64 {
+    let bin = RATE as f64 / 4096.0;
+    let mut mask = vec![false; p.len()];
+    for &fc in carriers {
+        let (lo, hi) = (((f64::from(fc) - 50.0) / bin).round() as usize, ((f64::from(fc) + 50.0) / bin).round() as usize);
+        mask[lo..=hi.min(p.len() - 1)].iter_mut().for_each(|m| *m = true);
+    }
+    // only the audio passband counts
+    let band = (300.0 / bin) as usize..(2900.0 / bin) as usize;
+    let inside: f64 = band.clone().filter(|&i| mask[i]).map(|i| p[i]).sum();
+    let count = band.clone().filter(|&i| mask[i]).count() as f64;
+    let total: f64 = band.map(|i| p[i] * p[i]).sum::<f64>().sqrt() + 1e-12;
+    inside / (count.sqrt() * total)
+}
+
 fn try_psk(s: &[f64], tables: &Tables, modes: &[Bandwidth]) -> Vec<Hit> {
     let len = s.len() as f64 / RATE as f64;
     let mut best: Option<Hit> = None;
@@ -289,12 +325,34 @@ fn try_psk(s: &[f64], tables: &Tables, modes: &[Bandwidth]) -> Vec<Hit> {
     let groups: Vec<Vec<Bandwidth>> = if modes[0] == Bandwidth::Hz500 { vec![vec![modes[0]], modes[1..].to_vec()] } else { vec![modes[..2].to_vec(), modes[2..].to_vec()] };
     for group in groups {
         let mut cands: Vec<(f64, Bandwidth, usize, &GridTables, f64)> = Vec::new();
+        // the carriers show in the spectrum: only the records whose carrier set fits best get the
+        // full search, which filters every carrier
+        let p = spectrum(s);
+        let mut fits: Vec<(f64, Bandwidth, usize, &GridTables)> = Vec::new();
         for &bw in &group {
             for (i, g) in grids(tables, bw, true) {
-                let flen = g.level.frame_seconds();
-                if len < flen {
-                    continue;
+                if let Wave::Psk { carriers, .. } = g.level.wave {
+                    if len >= g.level.frame_seconds() {
+                        fits.push((carrier_fit(&p, carriers), bw, i, g));
+                    }
                 }
+            }
+        }
+        fits.sort_by(|a, b| b.0.total_cmp(&a.0));
+        // records that share a carrier set tie; keep every record of the four best sets
+        let cut = fits.iter().map(|f| f.0).fold(Vec::<f64>::new(), |mut v, x| {
+            if v.last().map_or(true, |&l| (l - x).abs() > 1e-9) {
+                v.push(x);
+            }
+            v
+        });
+        let least = cut.get(3).or(cut.last()).copied().unwrap_or(0.0);
+        for &(fit, bw, i, g) in &fits {
+            if fit < least {
+                continue;
+            }
+            {
+                let flen = g.level.frame_seconds();
                 let front = psk::Front::new(s, g, &tables.psk, 0.0);
                 if let Some((score, m0, _)) = front.find(0.0, len - flen) {
                     cands.push((score, bw, i, g, front.seconds(m0)));
@@ -507,6 +565,20 @@ pub fn scan(x: &[f64], tables: &Tables) -> Scan {
 /// As `scan`, with callsigns the listener already knows: connect requests to them, and BREAK or
 /// IDLE of links they started, are then named even if no header frame was heard.
 pub fn scan_with(x: &[f64], tables: &Tables, calls: &[String]) -> Scan {
+    scan_live(x, tables, &mut Memory { calls: calls.to_vec(), ..Memory::default() })
+}
+
+/// What is carried from one stretch of audio to the next when a receiver is followed live:
+/// callsigns heard, keys found, and control bursts not yet explained.
+#[derive(Clone, Debug, Default)]
+pub struct Memory {
+    pub calls: Vec<String>,
+    pub keys: Vec<crate::ctrl::Key>,
+    pub pending: Vec<crate::ctrl::Measured>,
+}
+
+/// As `scan`, for one stretch of a live signal: uses and updates what earlier stretches gave.
+pub fn scan_live(x: &[f64], tables: &Tables, memory: &mut Memory) -> Scan {
     let mut events = Vec::new();
     let (list, db) = bursts(x);
     let push = |events: &mut Vec<Event>, lo: usize, a: usize, b: usize, level_db: f64, hits: Vec<Hit>| {
@@ -582,12 +654,12 @@ pub fn scan_with(x: &[f64], tables: &Tables, calls: &[String]) -> Scan {
         }
         let level_db = level_of(&db, a, b);
         if b - a >= 0.25 && b - a < 3.0 && level_db >= floor {
-            events.push(Event::Control(Control { time: a, seconds: b - a, level_db, station: 0, format: None, code: None, other: None }));
+            events.push(Event::Control(Control { time: a, seconds: b - a, level_db, station: 0, format: None, code: None, other: None, announces: None }));
         }
     }
     events.sort_by(|p, q| p.time().total_cmp(&q.time()));
     assign_stations(&mut events);
-    let keys = decode_control(x, &mut events, calls);
+    let keys = decode_control(x, &mut events, memory);
     Scan { events, keys }
 }
 
@@ -600,7 +672,7 @@ pub struct Scan {
 
 /// Measure every control burst, find each station's key from its own bursts and name the codes.
 /// Bursts the key does not explain are tested as connect requests, BREAK, IDLE and the fixed codes.
-fn decode_control(x: &[f64], events: &mut [Event], calls: &[String]) -> Vec<(usize, crate::ctrl::Key)> {
+fn decode_control(x: &[f64], events: &mut [Event], memory: &mut Memory) -> Vec<(usize, crate::ctrl::Key)> {
     use crate::ctrl;
     let good: Vec<&Found> = events.iter().filter_map(|e| if let Event::Frame(f) = e { f.crc_ok.then_some(f) } else { None }).collect();
     let mut offsets: Vec<f64> = good.iter().map(|f| f.offset).collect();
@@ -609,9 +681,13 @@ fn decode_control(x: &[f64], events: &mut [Event], calls: &[String]) -> Vec<(usi
     // the link's bandwidth mode: the one most frames were decoded in
     let bw = Bandwidth::ALL.into_iter().max_by_key(|b| good.iter().filter(|f| f.mode == b.hz()).count()).unwrap_or(Bandwidth::Hz2300);
     let bw = if good.is_empty() { Bandwidth::Hz2300 } else { bw };
-    // callsigns heard in header frames: (callsign, hash)
-    let mut heard: Vec<(String, u32)> = good.iter().filter_map(|f| crate::frame::header(&f.frame)).map(|h| (h.call.clone(), crate::frame::call_hash(&h.call))).collect();
-    heard.extend(calls.iter().map(|c| (c.to_uppercase(), crate::frame::call_hash(&c.to_uppercase()))));
+    // callsigns: the ones given or heard before, and those in this stretch's header frames
+    for h in good.iter().filter_map(|f| crate::frame::header(&f.frame)) {
+        if !memory.calls.contains(&h.call) {
+            memory.calls.push(h.call);
+        }
+    }
+    let heard: Vec<(String, u32)> = memory.calls.iter().map(|c| (c.to_uppercase(), crate::frame::call_hash(&c.to_uppercase()))).collect();
     let frame_ends: Vec<f64> = events.iter().filter_map(|e| if let Event::Frame(f) = e { Some(f.frame_end) } else { None }).collect();
     let mut measured: Vec<(usize, usize, ctrl::Measured)> = Vec::new(); // (event index, station, tones)
     for (i, e) in events.iter_mut().enumerate() {
@@ -622,24 +698,29 @@ fn decode_control(x: &[f64], events: &mut [Event], calls: &[String]) -> Vec<(usi
             }
         }
     }
-    let mut keys = Vec::new();
-    let mut stations: Vec<usize> = measured.iter().map(|m| m.1).collect();
-    stations.sort_unstable();
-    stations.dedup();
-    for st in stations {
-        let own: Vec<ctrl::Measured> = measured.iter().filter(|m| m.1 == st).map(|m| m.2.clone()).collect();
-        if let Some(key) = ctrl::resolve(&own, bw) {
-            keys.push((st, key));
-            for (i, _, m) in measured.iter().filter(|m| m.1 == st) {
-                if let Event::Control(c) = &mut events[*i] {
-                    c.code = ctrl::identify(m, key, bw);
-                }
+    // keys: the ones known already, and any that the unexplained bursts (old and new) agree on
+    let explained = |m: &ctrl::Measured, keys: &[ctrl::Key]| keys.iter().filter_map(|&k| ctrl::identify(m, k, bw).map(|c| (c, k))).max_by_key(|x| x.0 .1);
+    let mut open: Vec<ctrl::Measured> = memory.pending.clone();
+    open.extend(measured.iter().map(|m| m.2.clone()).filter(|m| explained(m, &memory.keys).is_none()));
+    for key in ctrl::resolve_all(&open, bw) {
+        if !memory.keys.contains(&key) {
+            memory.keys.push(key);
+        }
+    }
+    let mut keys: Vec<(usize, ctrl::Key)> = Vec::new();
+    for (i, st, m) in &measured {
+        if let Some((code, key)) = explained(m, &memory.keys) {
+            if let Event::Control(c) = &mut events[*i] {
+                c.code = Some(code);
+            }
+            if !keys.iter().any(|k| k.1 == key) {
+                keys.push((*st, key));
             }
         }
     }
     // callsign hashes worth testing: the ones heard, and both readings of every key
     let mut known: Vec<u32> = heard.iter().map(|h| h.1).collect();
-    for (_, key) in &keys {
+    for key in &memory.keys {
         let (a, b) = key.hashes();
         known.extend([a, b]);
     }
@@ -658,7 +739,10 @@ fn decode_control(x: &[f64], events: &mut [Event], calls: &[String]) -> Vec<(usi
                 ctrl::Other::Connect { code, caller, side } => {
                     format!("{}, sent by the station that {} (link started by {})", ctrl::code_name(code), if side == 0 { "made the call" } else { "answered" }, name(caller))
                 }
-                ctrl::Other::Fixed { code } => ctrl::code_name(code).to_string(),
+                ctrl::Other::Fixed { code } => {
+                    c.announces = Some(code);
+                    ctrl::code_name(code).to_string()
+                }
             };
             c.other = Some(format!("{text} ({hits} of {total} symbols)"));
             continue;
@@ -677,6 +761,16 @@ fn decode_control(x: &[f64], events: &mut [Event], calls: &[String]) -> Vec<(usi
             }
         }
     }
+    // single-tone bursts nothing explains yet wait for a second one from the same station
+    memory.pending.retain(|m| explained(m, &memory.keys).is_none());
+    for (i, _, m) in &measured {
+        let Event::Control(c) = &events[*i] else { continue };
+        if c.code.is_none() && c.other.is_none() && m.format < 2 && m.purity > 0.5 && !memory.pending.iter().any(|p| p.format == m.format && p.tones == m.tones) {
+            memory.pending.push(m.clone());
+        }
+    }
+    let extra = memory.pending.len().saturating_sub(12);
+    memory.pending.drain(..extra);
     keys
 }
 
@@ -733,7 +827,7 @@ mod tests {
     use super::*;
 
     fn ctl(time: f64, seconds: f64, level_db: f64) -> Event {
-        Event::Control(Control { time, seconds, level_db, station: 9, format: None, code: None, other: None })
+        Event::Control(Control { time, seconds, level_db, station: 9, format: None, code: None, other: None, announces: None })
     }
 
     fn stations(events: &[Event]) -> Vec<usize> {

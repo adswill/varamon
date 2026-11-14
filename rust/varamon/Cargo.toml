@@ -8,3 +8,9 @@ repository.workspace = true
 
 [dependencies]
 varamon-core = { path = "../varamon-core" }
+cpal = { version = "0.15", optional = true }
+
+[features]
+default = ["sound"]
+# audio input from a sound device; without it, live audio can still be piped in with --stdin
+sound = ["dep:cpal"]

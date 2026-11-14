@@ -288,3 +288,104 @@ mod header_tests {
         assert_eq!(header(&f), None);
     }
 }
+
+/// A CQ frame (500 Hz mode, record 15): the calling station and the bandwidth mode it listens in.
+/// The frame is six packed bytes and the CRC; there is no control byte.
+pub fn cq(frame: &[u8]) -> Option<(String, Option<u32>)> {
+    if frame.len() != 8 {
+        return None;
+    }
+    let v = frame[..6].iter().fold(0u64, |v, &x| (v << 8) | u64::from(x));
+    let mut call = String::new();
+    for i in (1..8).rev() {
+        match ((v >> (6 * i)) & 63) as u8 {
+            0 => call.push(' '),
+            c @ 1..=26 => call.push((b'A' + c - 1) as char),
+            c @ 27..=36 => call.push((b'0' + c - 27) as char),
+            _ => return None,
+        }
+    }
+    let mut call = call.trim_end().to_string();
+    if call.len() < 3 || call.contains(' ') {
+        return None;
+    }
+    let x = v & 63;
+    if x & 15 != 0 {
+        call += &format!("-{}", x & 15);
+    }
+    Some((call, [None, Some(500), Some(2300), Some(2750)][(x >> 4) as usize]))
+}
+
+/// What an unconnected (broadcast) message holds once its fragments are joined.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unconnected {
+    Text(Vec<u8>),
+    /// an AX.25 packet in the modem's packed form (not unpacked here)
+    Packet(Vec<u8>),
+}
+
+/// Join the fragments of an unconnected message (the payloads of the frames that follow the
+/// announcement burst) and read it. `None` if the fragments do not form one message.
+pub fn unconnected(fragments: &[Vec<u8>]) -> Option<Unconnected> {
+    let first = fragments.first()?;
+    let hdr = *first.first()?;
+    let mut body: Vec<u8> = Vec::new();
+    for (i, f) in fragments.iter().enumerate() {
+        let more = *f.first()? & 0x80 != 0;
+        if more != (i + 1 < fragments.len()) || (f[0] ^ hdr) & 0x7F != 0 {
+            return None;
+        }
+        // the first of several fragments carries the fragment count and a check nibble
+        let skip = if i == 0 && fragments.len() > 1 { 2 } else { 1 };
+        if i == 0 && fragments.len() > 1 && usize::from(*f.get(1)? & 0x0F) + 2 != fragments.len() {
+            return None;
+        }
+        body.extend(f.get(skip..)?);
+    }
+    match (hdr >> 4) & 3 {
+        2 if hdr & 1 == 0 => Some(Unconnected::Text(body)),
+        2 => {
+            // seven bits per character; the last run of equal bits is padding
+            let bits: Vec<u8> = body.iter().flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1)).collect();
+            let pad = *bits.last()?;
+            let end = bits.iter().rposition(|&b| b != pad).map_or(0, |i| i + 1);
+            Some(Unconnected::Text(bits[..end - end % 7].chunks(7).map(|c| c.iter().fold(0u8, |a, &b| (a << 1) | b)).collect()))
+        }
+        0 | 1 => Some(Unconnected::Packet(body)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod unconnected_tests {
+    use super::*;
+
+    #[test]
+    fn cq_frame() {
+        // N0CALL listening in the 2300 Hz mode: seven 6-bit characters, then mode * 16 + suffix
+        let mut f = pack_call("N0CALL").to_vec();
+        f[5] = (f[5] & 0xC0) | 2 * 16;
+        let crc = crate::crc::crc16(&f);
+        f.extend(crc.to_be_bytes());
+        assert_eq!(cq(&f), Some(("N0CALL".to_string(), Some(2300))));
+    }
+
+    #[test]
+    fn text_in_two_fragments() {
+        // "HELLO VARA" packed seven bits per character, header 0x21, split after four body bytes
+        let text = b"HELLO VARA";
+        let mut bits: Vec<u8> = text.iter().flat_map(|&c| (0..7).rev().map(move |i| (c >> i) & 1)).collect();
+        let pad = 1 - *bits.last().unwrap();
+        bits.push(pad);
+        while bits.len() % 8 != 0 {
+            bits.push(pad);
+        }
+        let body: Vec<u8> = bits.chunks(8).map(|c| c.iter().fold(0u8, |a, &b| (a << 1) | b)).collect();
+        let one = [vec![0x21], body.clone()].concat();
+        assert_eq!(unconnected(&[one]), Some(Unconnected::Text(text.to_vec())));
+        let a = [vec![0xA1, 0x00], body[..4].to_vec()].concat();
+        let b = [vec![0x21], body[4..].to_vec()].concat();
+        assert_eq!(unconnected(&[a.clone(), b]), Some(Unconnected::Text(text.to_vec())));
+        assert_eq!(unconnected(&[a]), None);
+    }
+}
