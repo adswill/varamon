@@ -80,7 +80,7 @@ pub fn fsk_tables(levels: &[FskLevel]) -> Vec<FskTables> {
     levels.iter().map(|&l| one_level(&mut r, l)).collect()
 }
 
-fn one_level(r: &mut VbRnd, l: FskLevel) -> FskTables {
+pub(crate) fn one_level(r: &mut VbRnd, l: FskLevel) -> FskTables {
     let chan = permutation(r, l.n());
     let turbo = permutation(r, l.k);
     let nsym = (l.symbols - 1) as usize;

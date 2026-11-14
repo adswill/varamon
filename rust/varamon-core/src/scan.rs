@@ -1,21 +1,27 @@
-//! Scanner: finds transmissions in a recording and decodes each one.
-//!
-//! This Rust port covers the tone-keyed levels of the 500, 2300 and 2750 Hz modes so far.
+//! Scanner: finds transmissions in a recording and decodes each one, whatever its bandwidth mode
+//! and level.
 
 use rustfft::num_complex::Complex64;
 use rustfft::FftPlanner;
 
 use crate::audio::RATE;
-use crate::fsk::{frame_seconds, try_level};
-use crate::tables::{fsk_tables, FskTables, BW2300, BW2750, BW500};
+use crate::levels::{self, Bandwidth, GridTables, Record, Wave};
+use crate::{fsk, ofdm, psk};
 
+/// Everything the receivers need, generated once.
 pub struct Tables {
-    pub modes: Vec<(u32, Vec<FskTables>)>,
+    pub modes: Vec<(Bandwidth, Vec<Record>)>,
+    pub psk: Vec<Vec<Complex64>>,
+    pub ofdm: Vec<Vec<Complex64>>,
 }
 
 impl Tables {
     pub fn new() -> Self {
-        Self { modes: vec![(2300, fsk_tables(&BW2300)), (2750, fsk_tables(&BW2750)), (500, fsk_tables(&BW500))] }
+        Self { modes: Bandwidth::ALL.iter().map(|&b| (b, levels::tables(b))).collect(), psk: levels::psk_phasors(), ofdm: levels::ofdm_phasors() }
+    }
+
+    fn mode(&self, bw: Bandwidth) -> &[Record] {
+        &self.modes.iter().find(|m| m.0 == bw).expect("every mode has tables").1
     }
 }
 
@@ -43,6 +49,8 @@ pub struct Found {
     /// where the frame itself starts and ends, in seconds
     pub frame_start: f64,
     pub frame_end: f64,
+    /// 0 for the first frame of a transmission, 1 for the one sent right behind it, ...
+    pub part: usize,
 }
 
 /// A short burst between frames: an acknowledgement or other control signal (not decoded).
@@ -149,27 +157,250 @@ pub fn segments(x: &[f64]) -> Vec<(usize, usize, f64)> {
         .collect()
 }
 
-/// Decode one transmission: try every tone-keyed level of every mode that fits its length.
-fn decode_segment(s: &[f64], tables: &Tables) -> Option<(u32, u32, crate::fsk::Decoded, f64)> {
-    let len = s.len() as f64 / RATE as f64;
-    let mut best: Option<(u32, u32, crate::fsk::Decoded, f64)> = None;
-    for (mode, levels) in &tables.modes {
-        for (i, t) in levels.iter().enumerate() {
-            let flen = frame_seconds(t);
-            if len < flen - 0.2 {
-                continue;
-            }
-            if let Some(d) = try_level(s, t, 0.0, (len - flen).clamp(0.05, 2.9)) {
-                if d.crc_ok {
-                    return Some((*mode, i as u32 + 1, d, flen));
-                }
-                if best.as_ref().map_or(true, |b| d.score > b.2.score) {
-                    best = Some((*mode, i as u32 + 1, d, flen));
-                }
+/// One decoded (or attempted) frame inside a slice of audio.
+struct Hit {
+    mode: u32,
+    level: u32,
+    frame: Vec<u8>,
+    crc_ok: bool,
+    score: f64,
+    offset: f64,
+    /// seconds from the start of the slice
+    start: f64,
+    seconds: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Fsk,
+    Psk,
+    Ofdm,
+}
+
+/// What kind of signal a transmission is: one tone at a time, OFDM (every symbol's end repeats at
+/// its start) or a few phase-keyed carriers.
+fn kind_of(s: &[f64]) -> Kind {
+    let mut planner = FftPlanner::new();
+    let mut share = 0.0f64;
+    for (n, lo, hi) in [(1024usize, 6usize, 64usize), (512, 3, 32)] {
+        let fft = planner.plan_fft_forward(n);
+        let window: Vec<f64> = (0..n).map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos()).collect();
+        let mut ratios: Vec<f64> = s
+            .chunks_exact(n)
+            .map(|c| {
+                let mut buf: Vec<Complex64> = c.iter().zip(&window).map(|(&v, &w)| Complex64::new(v * w, 0.0)).collect();
+                fft.process(&mut buf);
+                let p: Vec<f64> = buf[lo..hi].iter().map(|v| v.norm_sqr()).collect();
+                p.iter().fold(0.0f64, |a, &v| a.max(v)) / (p.iter().sum::<f64>() + 1e-12)
+            })
+            .collect();
+        if ratios.is_empty() {
+            continue;
+        }
+        ratios.sort_by(|a, b| a.total_cmp(b));
+        share = share.max(ratios[ratios.len() / 2]);
+    }
+    if share > 0.3 {
+        return Kind::Fsk;
+    }
+    match ofdm::Front::new(s, 8, 49) {
+        Some(f) if f.guard > 0.35 => Kind::Ofdm,
+        _ => Kind::Psk,
+    }
+}
+
+/// The bandwidth modes to try, most likely first: the 500 Hz mode keeps to 1250-1750 Hz.
+fn modes_in_order(s: &[f64]) -> Vec<Bandwidth> {
+    let n = s.len();
+    let mut buf: Vec<Complex64> = s.iter().map(|&v| Complex64::new(v, 0.0)).collect();
+    FftPlanner::new().plan_fft_forward(n).process(&mut buf);
+    let (mut inside, mut all) = (0.0, 1e-12);
+    for (i, v) in buf.iter().enumerate().take(n / 2) {
+        let f = i as f64 * RATE as f64 / n as f64;
+        if (300.0..=2900.0).contains(&f) {
+            all += v.norm_sqr();
+            if (1150.0..=1850.0).contains(&f) {
+                inside += v.norm_sqr();
             }
         }
     }
-    best
+    if inside / all > 0.9 {
+        vec![Bandwidth::Hz500, Bandwidth::Hz2300, Bandwidth::Hz2750]
+    } else {
+        vec![Bandwidth::Hz2300, Bandwidth::Hz2750, Bandwidth::Hz500]
+    }
+}
+
+fn try_fsk(s: &[f64], tables: &Tables, modes: &[Bandwidth]) -> Vec<Hit> {
+    let len = s.len() as f64 / RATE as f64;
+    let mut best: Option<Hit> = None;
+    for &bw in modes {
+        for (i, rec) in tables.mode(bw).iter().enumerate() {
+            let Record::Fsk(t) = rec else { continue };
+            let flen = fsk::frame_seconds(t);
+            if len < flen - 0.2 {
+                continue;
+            }
+            let hit = |d: fsk::Decoded| Hit { mode: bw.hz(), level: i as u32 + 1, frame: d.frame, crc_ok: d.crc_ok, score: d.score, offset: d.offset, start: d.start, seconds: flen };
+            let Some(d) = fsk::try_level(s, t, 0.0, (len - flen).clamp(0.05, 2.9)) else { continue };
+            if d.crc_ok {
+                // more frames may sit right before and right behind
+                let mut out = vec![hit(d)];
+                while out[0].start > flen {
+                    let prev = out[0].start - flen;
+                    match fsk::try_level(s, t, prev - 0.03, prev + 0.03) {
+                        Some(d) if d.crc_ok => out.insert(0, hit(d)),
+                        _ => break,
+                    }
+                }
+                loop {
+                    let next = out.last().map_or(0.0, |h| h.start + h.seconds);
+                    if next + flen > len + 0.05 {
+                        break;
+                    }
+                    match fsk::try_level(s, t, (next - 0.03).max(0.0), next + 0.03) {
+                        Some(d) if d.crc_ok => out.push(hit(d)),
+                        _ => break,
+                    }
+                }
+                return out;
+            }
+            if best.as_ref().map_or(true, |b| d.score > b.score) {
+                best = Some(hit(d));
+            }
+        }
+    }
+    best.into_iter().collect()
+}
+
+fn grids<'a>(tables: &'a Tables, bw: Bandwidth, psk: bool) -> impl Iterator<Item = (usize, &'a GridTables)> {
+    tables.mode(bw).iter().enumerate().filter_map(move |(i, rec)| match rec {
+        Record::Grid(g) if matches!(g.level.wave, Wave::Psk { .. }) == psk => Some((i, g)),
+        _ => None,
+    })
+}
+
+fn try_psk(s: &[f64], tables: &Tables, modes: &[Bandwidth]) -> Vec<Hit> {
+    let len = s.len() as f64 / RATE as f64;
+    let mut best: Option<Hit> = None;
+    // the 500 Hz mode is tried apart from the two wide ones
+    let groups: Vec<Vec<Bandwidth>> = if modes[0] == Bandwidth::Hz500 { vec![vec![modes[0]], modes[1..].to_vec()] } else { vec![modes[..2].to_vec(), modes[2..].to_vec()] };
+    for group in groups {
+        let mut cands: Vec<(f64, Bandwidth, usize, &GridTables, f64)> = Vec::new();
+        for &bw in &group {
+            for (i, g) in grids(tables, bw, true) {
+                let flen = g.level.frame_seconds();
+                if len < flen {
+                    continue;
+                }
+                let front = psk::Front::new(s, g, &tables.psk, 0.0);
+                if let Some((score, m0, _)) = front.find(0.0, len - flen) {
+                    cands.push((score, bw, i, g, front.seconds(m0)));
+                }
+            }
+        }
+        cands.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for &(_, bw, i, g, t) in cands.iter().take(2) {
+            let flen = g.level.frame_seconds();
+            let hit = |d: psk::Decoded| Hit { mode: bw.hz(), level: i as u32 + 1, frame: d.frame, crc_ok: d.crc_ok, score: d.score, offset: d.offset, start: d.start, seconds: flen };
+            let Some(d) = psk::try_level(s, g, &tables.psk, (t - 0.01).max(0.0), t + 0.01) else { continue };
+            if d.crc_ok {
+                let mut out = vec![hit(d)];
+                while out[0].start > flen + 0.004 {
+                    let prev = out[0].start - flen;
+                    match psk::try_level(s, g, &tables.psk, prev - 0.004, prev + 0.004) {
+                        Some(d) if d.crc_ok => out.insert(0, hit(d)),
+                        _ => break,
+                    }
+                }
+                loop {
+                    let next = out.last().map_or(0.0, |h| h.start + h.seconds);
+                    if next + flen > len {
+                        break;
+                    }
+                    match psk::try_level(s, g, &tables.psk, next - 0.004, next + 0.004) {
+                        Some(d) if d.crc_ok => out.push(hit(d)),
+                        _ => break,
+                    }
+                }
+                return out;
+            }
+            if best.as_ref().map_or(true, |b| d.score > b.score) {
+                best = Some(hit(d));
+            }
+        }
+    }
+    best.into_iter().collect()
+}
+
+fn try_ofdm(s: &[f64], tables: &Tables, modes: &[Bandwidth]) -> Vec<Hit> {
+    let mut best: Option<Hit> = None;
+    for &bw in modes {
+        let mut front: Option<ofdm::Front> = None;
+        let mut cands: Vec<(f64, usize, &GridTables, usize)> = Vec::new();
+        for (i, g) in grids(tables, bw, false) {
+            // record 17 of the 2300 Hz mode uses the narrow grid: it needs its own front end
+            if !front.as_ref().is_some_and(|f| f.fits(g)) {
+                front = ofdm::Front::of(s, g);
+            }
+            let Some(f) = &front else { continue };
+            if let Some((score, q0)) = f.find(g, &tables.ofdm) {
+                cands.push((score, i, g, q0));
+            }
+        }
+        cands.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for &(_, i, g, q0) in cands.iter().take(4) {
+            let Some(f) = ofdm::Front::of(s, g) else { continue };
+            let flen = g.level.frame_seconds();
+            let hit = |d: ofdm::Decoded| Hit { mode: bw.hz(), level: i as u32 + 1, frame: d.frame, crc_ok: d.crc_ok, score: d.score, offset: d.offset, start: d.start, seconds: flen };
+            let d = f.decode(g, &tables.ofdm, q0);
+            if d.crc_ok {
+                let mut out = vec![hit(d)];
+                let rows = (g.level.spf - 1) as usize;
+                let mut q = q0 + rows;
+                while f.has_room(g, q) {
+                    let d = f.decode(g, &tables.ofdm, q);
+                    if !d.crc_ok {
+                        break;
+                    }
+                    out.push(hit(d));
+                    q += rows;
+                }
+                return out;
+            }
+            if best.as_ref().map_or(true, |b| d.score > b.score) {
+                best = Some(hit(d));
+            }
+        }
+    }
+    best.into_iter().collect()
+}
+
+/// Decode one transmission: work out the kind of signal, then try the levels of that kind in
+/// every bandwidth mode. If nothing decodes, the other kinds get a try as well. Returns every
+/// frame of the transmission, or the best failed attempt.
+fn decode_segment(s: &[f64], tables: &Tables) -> Vec<Hit> {
+    let modes = modes_in_order(s);
+    let order = match kind_of(s) {
+        Kind::Fsk => [Kind::Fsk, Kind::Psk, Kind::Ofdm],
+        Kind::Psk => [Kind::Psk, Kind::Ofdm, Kind::Fsk],
+        Kind::Ofdm => [Kind::Ofdm, Kind::Psk, Kind::Fsk],
+    };
+    let mut failed: Option<Hit> = None;
+    for kind in order {
+        let hits = match kind {
+            Kind::Fsk => try_fsk(s, tables, &modes),
+            Kind::Psk => try_psk(s, tables, &modes),
+            Kind::Ofdm => try_ofdm(s, tables, &modes),
+        };
+        if hits.first().is_some_and(|h| h.crc_ok) {
+            return hits;
+        }
+        if failed.is_none() {
+            failed = hits.into_iter().next();
+        }
+    }
+    failed.into_iter().collect()
 }
 
 /// Every burst of at least 0.25 s as (start, end, level in dB), cut at gaps of 0.08 s or more.
@@ -241,7 +472,8 @@ fn assign_stations(events: &mut [Event]) {
     for (i, ev) in events.iter_mut().enumerate() {
         let gap = ev.time() - prev_end;
         let lv = ev.level();
-        if i > 0 {
+        let follows = matches!(ev, Event::Frame(f) if f.part > 0); // sent right behind the previous frame
+        if i > 0 && !follows {
             if gap > NEW_LINK {
                 pair = [next_label, next_label + 1];
                 next_label += 2;
@@ -272,21 +504,22 @@ pub fn scan(x: &[f64], tables: &Tables) -> Scan {
         // 2 s margin before and 0.7 s after: a faded start or end is common off air
         let lo = a.saturating_sub(2 * RATE);
         let hi = (b + RATE * 7 / 10).min(x.len());
-        if let Some((mode, level, d, flen)) = decode_segment(&x[lo..hi], tables) {
-            let frame_start = lo as f64 / RATE as f64 + d.start;
+        for (part, h) in decode_segment(&x[lo..hi], tables).into_iter().enumerate() {
+            let frame_start = lo as f64 / RATE as f64 + h.start;
             events.push(Event::Frame(Found {
                 time: a as f64 / RATE as f64,
                 seconds: (b - a) as f64 / RATE as f64,
-                mode,
-                level,
-                frame: d.frame,
-                crc_ok: d.crc_ok,
-                score: d.score,
-                offset: d.offset,
+                mode: h.mode,
+                level: h.level,
+                frame: h.frame,
+                crc_ok: h.crc_ok,
+                score: h.score,
+                offset: h.offset,
                 level_db,
                 station: 0,
                 frame_start,
-                frame_end: frame_start + flen,
+                frame_end: frame_start + h.seconds,
+                part,
             }));
         }
     }
@@ -376,6 +609,9 @@ pub fn stream_of(found: &[&Found], station: usize) -> Vec<(bool, Vec<Vec<u8>>)> 
             continue;
         }
         prev = Some(&f.frame[..]);
+        if crate::frame::header(&f.frame).is_some() {
+            continue; // the header frame carries the callsign, not application data
+        }
         let Some(p) = crate::frame::parse(&f.frame) else { continue };
         let Some(data) = p.data else { continue };
         if data.is_empty() {

@@ -3,7 +3,8 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use varamon_core::{audio, b2f, ctrl, frame, scan};
+use varamon_core::levels::Bandwidth;
+use varamon_core::{audio, b2f, ctrl, frame, scan, synth};
 
 const USAGE: &str = "usage: varamon [--hex] RECORDING.wav ...
 
@@ -11,6 +12,7 @@ Receive-only monitor for VARA HF signals. Recordings are 16-bit WAV of the recei
 
   --hex       also print the bytes of each decoded frame
   --mail      show the headers and text of mail messages (off by default: they are other people's mail)
+  --selftest  generate a test signal for every level of every bandwidth mode and decode it
   --version   print the version
   --help      print this text";
 
@@ -23,6 +25,9 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "--version") {
         println!("{}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
+    }
+    if args.iter().any(|a| a == "--selftest") {
+        return if selftest() { ExitCode::SUCCESS } else { ExitCode::FAILURE };
     }
     let hex = args.iter().any(|a| a == "--hex");
     let show_mail = args.iter().any(|a| a == "--mail");
@@ -60,9 +65,15 @@ fn main() -> ExitCode {
                 }
                 scan::Event::Frame(f) => f,
             };
-            let head = format!("{:8.2} s  {:5.2} s  station {}  {:4} Hz L{:<2} ", f.frame_start, f.frame_end - f.frame_start, label(f.station), f.mode, f.level);
+            let what = Bandwidth::from_hz(f.mode).map(|b| b.levels()[f.level as usize - 1].describe()).unwrap_or_default();
+            let head = format!("{:8.2} s  {:5.2} s  station {}  {:4} Hz L{:<2} ({what})  ", f.frame_start, f.frame_end - f.frame_start, label(f.station), f.mode, f.level);
             if !f.crc_ok {
                 println!("{head}not decoded (CRC failed, pattern match {:.2})", f.score);
+                continue;
+            }
+            if let Some(h) = frame::header(&f.frame) {
+                let comp = ["no compression", "text compression", "files compression", "compression 3"][h.compression as usize];
+                println!("{head}link start: callsign {}, {comp}, proposes level {}  (callsign hash {:06x})", h.call, h.offer, frame::call_hash(&h.call));
                 continue;
             }
             let Some(p) = frame::parse(&f.frame) else { continue };
@@ -85,7 +96,16 @@ fn main() -> ExitCode {
         let found = scan::frames(events);
         for (st, key) in &result.keys {
             let (caller, answerer) = key.hashes();
-            println!("station {} key found: callsign hash {caller:06x} if it made the call, {answerer:06x} if it answered", label(*st));
+            // a callsign heard in a header frame may be this station's
+            let heard: Vec<String> = found.iter().filter(|f| f.crc_ok).filter_map(|f| frame::header(&f.frame)).map(|h| h.call).collect();
+            let who = heard.iter().find_map(|c| {
+                let h = frame::call_hash(c);
+                (h == caller).then(|| format!("{c}, the station that made the call")).or_else(|| (h == answerer).then(|| format!("{c}, the station that answered")))
+            });
+            match who {
+                Some(w) => println!("station {} is {w}", label(*st)),
+                None => println!("station {} key found: callsign hash {caller:06x} if it made the call, {answerer:06x} if it answered", label(*st)),
+            }
         }
         let stations = found.iter().map(|f| f.station + 1).max().unwrap_or(0);
         for s in 0..stations {
@@ -155,4 +175,40 @@ fn main() -> ExitCode {
         println!("{} frames, {} decoded with correct CRC; {} control bursts\n", found.len(), found.iter().filter(|f| f.crc_ok).count(), events.len() - found.len());
     }
     status
+}
+
+/// Generate every record of every bandwidth mode with noise and a tuning offset, run each
+/// through the scanner and compare the frames. Returns true if all come back exactly.
+fn selftest() -> bool {
+    let tables = scan::Tables::new();
+    let mut all_ok = true;
+    for bw in [Bandwidth::Hz500, Bandwidth::Hz2300, Bandwidth::Hz2750] {
+        let recs = &tables.modes.iter().find(|m| m.0 == bw).expect("mode").1;
+        let mut good = 0;
+        for (i, level) in bw.levels().iter().enumerate() {
+            // short records are sent three at a time, every fourth record two at a time
+            let count = if level.frame_seconds() < 3.0 { 3 } else if i % 4 == 3 { 2 } else { 1 };
+            let frames: Vec<Vec<u8>> = (0..count).map(|j| synth::test_frame(level, (i * 7 + j) as u32)).collect();
+            let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+            let mut n = 99 + i as u32;
+            let mut rand = |m: u32| {
+                n = n.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (n >> 16) % m
+            };
+            let offset = if i % 2 == 0 { 4.0 } else { -6.0 };
+            let x = synth::on_air(&synth::transmission(level, &recs[i], &refs, &mut rand), 0.3, 1.0, offset, 0.03, 1000 + i as u64);
+            let result = scan::scan(&x, &tables);
+            let got: Vec<&scan::Found> = scan::frames(&result.events);
+            let ok = got.len() == count && got.iter().zip(&frames).all(|(g, f)| g.crc_ok && g.mode == bw.hz() && g.level as usize == i + 1 && &g.frame == f);
+            if ok {
+                good += 1;
+            } else {
+                all_ok = false;
+                let seen: Vec<String> = got.iter().map(|g| format!("{} Hz L{} {}", g.mode, g.level, if g.crc_ok { "CRC ok" } else { "CRC failed" })).collect();
+                println!("  {} Hz record {:2} ({}, {} frame{}): FAILED, scanner saw [{}]", bw.hz(), i + 1, level.describe(), count, if count == 1 { "" } else { "s" }, seen.join(", "));
+            }
+        }
+        println!("{} Hz mode: {good} of {} records decoded", bw.hz(), bw.levels().len());
+    }
+    all_ok
 }

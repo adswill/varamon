@@ -5,6 +5,9 @@ Sources of the waveform description:
 - the published source of xara (https://github.com/x0rro/xara), MIT licence, copyright (c) 2026 x0rro, which was read as
   documentation of the signal format.
 
+The level parameters in rust/varamon-core/src/levels.rs (symbol counts, carrier frequencies, code rates, frame sizes), the
+constellations and the pulse shapes are the signal's own; they were taken from xara's description of them.
+
 Included from xara, under its MIT licence:
 - rust/varamon-core/src/textcomp.dict, the phrase and code table of the modem's text compression. The Rust code that reads
   it (textcomp.rs) follows xara's coder closely.

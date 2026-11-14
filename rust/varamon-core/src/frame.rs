@@ -176,3 +176,88 @@ mod tests {
         assert_eq!(text_runs(b"\x01\x02CALLSIGN\x00ab\x05", 4), vec!["CALLSIGN".to_string()]);
     }
 }
+
+/// The header frame a station sends when a link starts: its callsign and what it offers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Header {
+    pub call: String,
+    /// compression the station offers: 0 none, 1 text, 2 files
+    pub compression: u8,
+    /// the level the station proposes for the other direction
+    pub offer: u8,
+    pub registered: bool,
+}
+
+/// A callsign from its packed form: eight 6-bit codes in six bytes (seven characters, then the suffix).
+pub fn unpack_call(b: &[u8]) -> Option<String> {
+    let v = b.get(..6)?.iter().fold(0u64, |v, &x| (v << 8) | u64::from(x));
+    let mut base = String::new();
+    let mut ended = false;
+    for i in (1..8).rev() {
+        match ((v >> (6 * i)) & 63) as u8 {
+            0 => ended = true,
+            _ if ended => return None, // a character after the end of the callsign
+            c @ 1..=26 => base.push((b'A' + c - 1) as char),
+            c @ 27..=36 => base.push((b'0' + c - 27) as char),
+            _ => return None,
+        }
+    }
+    if base.len() < 3 {
+        return None;
+    }
+    Some(match (v & 63) as u8 {
+        0 => base,
+        0x10 => base + "-T",
+        0x11 => base + "-R",
+        0x12 => base + "-X",
+        0x13 => base + "-L",
+        n if n < 0x10 => format!("{base}-{n}"),
+        _ => return None,
+    })
+}
+
+/// Read a frame as a header frame. `None` if it does not have the shape of one.
+pub fn header(frame: &[u8]) -> Option<Header> {
+    let p = parse(frame)?;
+    let data = p.data?;
+    if !p.last || p.compressed || data.len() != 8 || data[6] != 0 || data[7] & 0x80 == 0 {
+        return None;
+    }
+    Some(Header { call: unpack_call(&data)?, compression: (data[7] >> 1) & 3, offer: p.next_level?, registered: data[7] & 1 != 0 })
+}
+
+/// The 24-bit number a callsign is turned into for the control bursts.
+pub fn call_hash(call: &str) -> u32 {
+    let b = call.as_bytes();
+    if b.is_empty() {
+        return 0;
+    }
+    let c1 = u32::from(crate::crc::crc16(b));
+    let c2 = u32::from(crate::crc::crc16(&b[b.len().saturating_sub(3)..]));
+    ((c2 >> 8) << 16) | c1
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    #[test]
+    fn header_frame_gives_the_callsign() {
+        // header frames of levels 1 and 2 as sent on the air: callsign N0CALL
+        let unhex = |h: &str| (0..h.len() / 2).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()).collect::<Vec<u8>>();
+        let h = header(&unhex("39b0c130c00000800183df5c")).expect("level 1 header");
+        assert_eq!((h.call.as_str(), h.offer, h.compression), ("N0CALL", 1, 0));
+        let h = header(&unhex("39b0c130c0000080140900000000000000000000000282f5b2")).expect("level 2 header");
+        assert_eq!((h.call.as_str(), h.offer, h.compression), ("N0CALL", 2, 0));
+        assert_eq!(call_hash("N0CALL"), 0xD80986);
+        assert_eq!(unpack_call(&[0x04, 0x27, 0x03, 0x10, 0x00, 0x01]).as_deref(), Some("AB1CD-1"));
+    }
+
+    #[test]
+    fn data_frames_are_not_headers() {
+        let mut f = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 0x03];
+        let crc = crate::crc::crc16(&f);
+        f.extend(crc.to_be_bytes());
+        assert_eq!(header(&f), None);
+    }
+}
