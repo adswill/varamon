@@ -33,15 +33,27 @@ It also decodes:
 - the special frame types of each mode (records 14-17 of the 500 Hz mode, record 17 of the 2300 Hz mode);
 - transmissions that carry several frames back to back;
 - the header frame at the start of a link, which gives the station's callsign;
-- control bursts: all 58 codes in the three burst formats and the three tone sets. The station's key is found from the signal. Named: acknowledgements, connect requests and replies, BREAK, IDLE, GO AHEAD, start level, reject, disconnect, CQ.
+- control bursts: all 58 codes in the three burst formats and the three tone sets. The station's key is found from the signal. Named: acknowledgements, connect requests and replies, BREAK, IDLE, GO AHEAD, start level, reject, disconnect, CQ;
+- CQ frames (who is calling, and the mode they listen in) and unconnected text messages, with their fragments joined.
 
 The bandwidth mode and level are worked out from the signal; nothing has to be set.
 
 A connect request names the called station only by a 24-bit number made from its callsign. varamon shows the callsign when it hears that station's header frame, or when you give it with `--call CALLSIGN`.
 
-- CQ frames (who is calling, and the mode they listen in) and unconnected text messages, with their fragments joined.
+### VARA FM
 
-Not decoded: unconnected AX.25 packets (they are recognised, their packed form is not unpacked), a short special frame sent on its own, VARA FM, VARA SAT. The Python version covers the 2300 Hz mode and the tone-keyed levels of the other two.
+With `--fm` the Rust version decodes VARA FM recordings:
+
+| Mode | Records |
+|---|---|
+| narrow | all 17: connect, start, short, broadcast, and data levels 1-11 (14 to 58 carriers, 4-phase to 256QAM) |
+| wide | all 17: connect, start, short, broadcast, and data levels 1-13 (14 to 116 carriers, 4-phase to 256QAM) |
+
+- The connect frame gives both callsigns, the mode and the relays; the data frames are then descrambled with the called station's key.
+- All 24 tone-burst codes are named (acknowledgements, GO AHEAD, BREAK, IDLE, NO TRAFFIC, QRT, connect reply).
+- When the connect frame was not heard and no callsign is given, the key is found from the link's tone bursts, and the data frames decode all the same.
+
+Not decoded: unconnected AX.25 packets (they are recognised, their packed form is not unpacked), a short special frame sent on its own, VARA SAT. The Python version covers the 2300 Hz mode of VARA HF and the tone-keyed levels of the other two.
 
 ## Requirements
 
@@ -70,6 +82,7 @@ or run it from the folder without installing: `pip install numpy`, then `python 
 | `python -m varamon --selftest` | decodes generated test signals |
 | `python -m varamon --help` | all options |
 | `varamon --call N0CALL recording.wav` | Rust version: name calls to a callsign you know |
+| `varamon --fm recording.wav` | Rust version: decode a VARA FM recording |
 | `varamon --live` | Rust version: listen to the default sound input (`--live NAME` picks one, `--devices` lists them) |
 | `sox -d -t raw -r 48000 -e signed -b 16 -c 1 - \| varamon --stdin 48000` | Rust version: listen to audio piped in as raw 16-bit samples |
 
@@ -105,6 +118,8 @@ The web page shows the same list with a details pane, the frame bytes, a waterfa
 | Frame coding of all 51 records (frame bytes to transmitted bits) | outside test vectors, bit for bit (`tools/check_vectors.py`) |
 | Waveform of the tone-keyed, phase-keyed and OFDM levels (2300 Hz mode) | samples of real transmissions (`tools/check_audio.py`): the generated audio differs by -36 dB or less |
 | Receivers of all 51 records | signals from that generator, with noise and a tuning offset (`varamon --selftest`) |
+| VARA FM generator: all 34 records and 72 tone bursts | outside reference audio, sample for sample (SHA-256 of the 16-bit audio, `tools/check_fm.py`) |
+| VARA FM receiver | a real cable-to-cable session (all 22 transmissions decoded, with and without its connect frame), and every record of both modes from the generator (`varamon --selftest`) |
 | Live input (Python version) | recorded audio fed through the page's server |
 
 No public off-air recording holds the phase-keyed or OFDM levels, so those receivers have not met a real fading channel yet.

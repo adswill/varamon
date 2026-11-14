@@ -9,7 +9,7 @@ fn unhex(s: &str) -> Vec<u8> {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let bw = Bandwidth::from_hz(a[2].parse().unwrap()).unwrap();
+    let bw = a[2].parse().ok().and_then(Bandwidth::from_hz).unwrap_or(Bandwidth::Hz2300);
     let rec: usize = a[3].parse().unwrap();
     let t = tables(bw);
     match a[1].as_str() {
@@ -61,6 +61,36 @@ fn main() {
                     println!("conn{side}_49 {}\nconn{side}_50 {}", show(&pair[0]), show(&pair[1]));
                 }
             }
+        }
+        "fmaudio" => {
+            // vectool fmaudio narrow|wide RECORD OUT.i16 KEY LEAD DRAWS FRAMEHEX...
+            use varamon_core::fm;
+            let mode = if a[2] == "wide" { fm::Mode::Wide } else { fm::Mode::Narrow };
+            let tabs = fm::tables(mode);
+            let key: u32 = a[5].parse().unwrap();
+            let lead: usize = a[6].parse().unwrap();
+            let draws: Vec<u32> = a[7].split(',').filter(|s| !s.is_empty()).map(|s| s.parse().unwrap()).collect();
+            let frames: Vec<Vec<u8>> = a[8..].iter().map(|h| unhex(h)).collect();
+            let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+            let mut it = draws.into_iter();
+            let mut rand = |m: u32| {
+                let v = it.next().expect("ran out of draws");
+                assert!(v < m);
+                v
+            };
+            let x = fm::transmission(mode, &tabs, rec, key, &refs, lead, -5.0, &mut rand);
+            let bytes: Vec<u8> = x.iter().flat_map(|&v| ((v * 32767.0).round_ties_even() as i16).to_le_bytes()).collect();
+            std::fs::write(&a[4], bytes).unwrap();
+        }
+        "fmtone" => {
+            // vectool fmtone 0 CODE OUT.i16 UPSTREAM DOWNSTREAM LEAD
+            use varamon_core::fm;
+            use varamon_core::frame::call_hash;
+            let book = fm::codebook(call_hash(&a[6]), call_hash(&a[5]));
+            let lead: usize = a[7].parse().unwrap();
+            let x = fm::tone_audio(&book[rec - 1], lead, -5.0);
+            let bytes: Vec<u8> = x.iter().flat_map(|&v| ((v * 32767.0).round_ties_even() as i16).to_le_bytes()).collect();
+            std::fs::write(&a[4], bytes).unwrap();
         }
         _ => panic!("unknown command"),
     }

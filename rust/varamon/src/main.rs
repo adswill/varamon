@@ -6,9 +6,9 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use varamon_core::levels::Bandwidth;
-use varamon_core::{audio, b2f, ctrl, frame, scan, synth};
+use varamon_core::{audio, b2f, ctrl, fm, fmscan, frame, scan, synth};
 
-const USAGE: &str = "usage: varamon [--hex] [--mail] [--call CALLSIGN] RECORDING.wav ...
+const USAGE: &str = "usage: varamon [--fm] [--hex] [--mail] [--call CALLSIGN] RECORDING.wav ...
        varamon --live [NAME]
        varamon --stdin RATE
 
@@ -20,6 +20,7 @@ Receive-only monitor for VARA HF signals. Recordings are 16-bit WAV of the recei
   --live [NAME]     listen to a sound input (the default one, or the first whose name contains NAME)
   --devices   list the sound inputs
   --stdin RATE      listen to raw audio on standard input: 16-bit, one channel, RATE samples a second
+  --fm        the recordings are VARA FM (default: VARA HF)
   --selftest  generate a test signal for every level of every bandwidth mode and decode it
   --version   print the version
   --help      print this text";
@@ -35,7 +36,9 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.iter().any(|a| a == "--selftest") {
-        return if selftest() { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+        let fm_only = args.iter().any(|a| a == "--fm");
+        let ok = (fm_only || selftest()) & selftest_fm();
+        return if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE };
     }
     let hex = args.iter().any(|a| a == "--hex");
     let show_mail = args.iter().any(|a| a == "--mail");
@@ -81,6 +84,20 @@ fn main() -> ExitCode {
     if files.is_empty() {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
+    }
+    if args.iter().any(|a| a == "--fm") {
+        let mut tabs = fmscan::FmTables::new();
+        let mut status = ExitCode::SUCCESS;
+        for path in files {
+            match audio::load(Path::new(path)) {
+                Ok(x) => fm_file(path, &x, &mut tabs, &calls, hex),
+                Err(e) => {
+                    eprintln!("{path}: {e}");
+                    status = ExitCode::FAILURE;
+                }
+            }
+        }
+        return status;
     }
     let tables = scan::Tables::new();
     let mut status = ExitCode::SUCCESS;
@@ -334,6 +351,153 @@ fn selftest() -> bool {
             }
         }
         println!("{} Hz mode: {good} of {} records decoded", bw.hz(), bw.levels().len());
+    }
+    all_ok
+}
+
+/// Decode one VARA FM recording and print what was sent.
+fn fm_file(path: &str, x: &[f64], tabs: &mut fmscan::FmTables, calls: &[String], hex: bool) {
+    let name = Path::new(path).file_name().map_or(path.into(), |n| n.to_string_lossy());
+    println!("{name}: {:.1} s, VARA FM", x.len() as f64 / audio::RATE as f64);
+    let r = fmscan::scan(x, tabs, calls);
+    // the station that sent the connect frame is the caller
+    let connect = r.events.iter().find_map(|e| match e {
+        fmscan::FmEvent::Frame(f) if f.rec == 0 && f.crc_ok => fm::connect(&f.frame).map(|c| (f.station, c)),
+        _ => None,
+    });
+    let who = |st: usize| -> String {
+        match &connect {
+            Some((s, c)) if *s == st => c.source.clone(),
+            Some((_, c)) => c.target.clone(),
+            None => format!("station {}", (b'A' + st as u8) as char),
+        }
+    };
+    for ev in &r.events {
+        match ev {
+            fmscan::FmEvent::Tone(t) => {
+                let what = match t.code {
+                    // without the connect frame the caller's hash, and so narrow or wide reply, is not certain
+                    Some((c @ (23 | 24), hits)) if connect.is_none() => format!("CONNECT REPLY (code {c}, {hits} of 10 symbols)"),
+                    Some((c, hits)) => format!("{} (code {c}, {hits} of 10 symbols)", fm::code_name(c)),
+                    None => "tone burst, link not known".to_string(),
+                };
+                println!("{:8.2} s  {:5.2} s  {:<10}  {what}", t.time, t.seconds, who(t.station));
+            }
+            fmscan::FmEvent::Frame(f) => {
+                let l = f.mode.records()[f.rec];
+                let head = format!("{:8.2} s  {:5.2} s  {:<10}  {} record {:<2} ({}, {})  ", f.time, f.seconds, who(f.station), f.mode.name(), f.rec, fm::record_name(f.rec), l.describe());
+                if !f.crc_ok {
+                    println!("{head}not decoded (CRC failed, pattern match {:.2})", f.score);
+                    continue;
+                }
+                if let Some(c) = fm::connect(&f.frame).filter(|_| f.rec == 0) {
+                    let via: Vec<&str> = [c.via1.as_str(), c.via2.as_str()].into_iter().filter(|v| !v.is_empty()).collect();
+                    println!("{head}{} calls {}{}, {} mode{}", c.source, c.target, if via.is_empty() { String::new() } else { format!(" via {}", via.join(", ")) },
+                        if c.wide { "wide" } else { "narrow" }, if c.registered { ", registered" } else { "" });
+                } else if let Some(d) = fm::data(f.rec, &f.frame, r.link.relayed) {
+                    let flags: Vec<&str> = [(d.last, "last"), (d.compressed, "compressed")].iter().filter(|x| x.0).map(|x| x.1).collect();
+                    let content = if d.data.is_empty() {
+                        "empty".to_string()
+                    } else if frame::is_text(&d.data) && !d.compressed {
+                        format!("text  \"{}\"", frame::text_of(&d.data))
+                    } else {
+                        format!("data  {} bytes", d.data.len())
+                    };
+                    println!("{head}{content}{}", if flags.is_empty() { String::new() } else { format!("  [{}]", flags.join(", ")) });
+                }
+                if hex {
+                    println!("            {}", f.frame.iter().map(|b| format!("{b:02x}")).collect::<String>());
+                }
+            }
+        }
+    }
+    match (&connect, r.link.called) {
+        (Some((_, c)), _) => println!("link: {} calls {}, {} mode; the key comes from the connect frame", c.source, c.target, if c.wide { "wide" } else { "narrow" }),
+        (None, Some(k)) => println!("link: {} mode; key {k:06x} (callsign hash of the called station) found from {}", r.link.mode.map_or("unknown", |m| m.name()), r.link.key_from),
+        (None, None) => println!("link: key not found; give a callsign with --call to decode the data frames"),
+    }
+    // each station's data, joined in time order
+    let frames: Vec<&fmscan::FmFrame> = r.events.iter().filter_map(|e| if let fmscan::FmEvent::Frame(f) = e { Some(f) } else { None }).collect();
+    for st in 0..2 {
+        let mut data: Vec<u8> = Vec::new();
+        let mut packed: Vec<Vec<u8>> = Vec::new();
+        let mut n = 0;
+        for f in frames.iter().filter(|f| f.station == st && f.crc_ok && f.rec != 0) {
+            if let Some(d) = fm::data(f.rec, &f.frame, r.link.relayed) {
+                n += 1;
+                if d.compressed {
+                    packed.push(d.data);
+                } else {
+                    data.extend(d.data);
+                }
+            }
+        }
+        if n == 0 {
+            continue;
+        }
+        if !packed.is_empty() {
+            match scan::unpack(&packed) {
+                Some((out, mode)) => {
+                    println!("{}: {} compressed bytes unpacked to {} ({mode})", who(st), packed.iter().map(|p| p.len()).sum::<usize>(), out.len());
+                    data.extend(out);
+                }
+                None => println!("{}: {} compressed bytes could not be unpacked", who(st), packed.iter().map(|p| p.len()).sum::<usize>()),
+            }
+        }
+        if frame::is_text(&data) {
+            println!("{}: {n} frames, {} bytes of text:\n    {}", who(st), data.len(), frame::text_of(&data).replace("\\n", "\n    "));
+        } else {
+            let pieces = frame::text_runs(&data, 8);
+            println!("{}: {n} frames, {} bytes, not plain text{}", who(st), data.len(), if pieces.is_empty() { String::new() } else { format!("; readable pieces: {}", pieces.join(" | ")) });
+        }
+    }
+    println!();
+}
+
+/// Every record of both FM modes, generated with noise, through the FM scanner.
+fn selftest_fm() -> bool {
+    let mut tabs = fmscan::FmTables::new();
+    let called = "N1CALL";
+    let key = frame::call_hash(called);
+    let mut all_ok = true;
+    for mode in [fm::Mode::Narrow, fm::Mode::Wide] {
+        let t = fm::tables(mode);
+        let mut good = 0;
+        for rec in 0..fm::RECORDS {
+            let l = mode.records()[rec];
+            let count = if l.spf < 60 { 2 } else { 1 };
+            let frames: Vec<Vec<u8>> = (0..count)
+                .map(|j| {
+                    let mut s = (rec * 7 + j + 1) as u32;
+                    let mut f: Vec<u8> = (0..l.frame_bytes() - 2).map(|_| { s = s.wrapping_mul(1_103_515_245).wrapping_add(12345); (s >> 16) as u8 }).collect();
+                    let c = varamon_core::crc::crc16(&f);
+                    f.extend(c.to_be_bytes());
+                    f
+                })
+                .collect();
+            let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+            let mut n = 77 + rec as u32;
+            let mut rand = |m: u32| {
+                n = n.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (n >> 16) % m
+            };
+            let x = fm::transmission(mode, &t, rec, key, &refs, 4, 0.0, &mut rand);
+            let noise = if l.bps >= 6 { 0.002 } else { 0.01 };
+            let x = synth::on_air(&x, 0.5, 0.5, 0.0, noise, 900 + rec as u64);
+            let r = fmscan::scan(&x, &mut tabs, &[called.to_string()]);
+            let got: Vec<&fmscan::FmFrame> = r.events.iter().filter_map(|e| if let fmscan::FmEvent::Frame(f) = e { Some(f) } else { None }).collect();
+            // records 0-3 and 16 have the same tables in both modes
+            let same_mode = |m: fm::Mode| m == mode || rec <= 3 || rec == 16;
+            let ok = got.len() == count && got.iter().zip(&frames).all(|(g, f)| g.crc_ok && g.rec == rec && same_mode(g.mode) && &g.frame == f);
+            if ok {
+                good += 1;
+            } else {
+                all_ok = false;
+                let seen: Vec<String> = got.iter().map(|g| format!("{} record {} {}", g.mode.name(), g.rec, if g.crc_ok { "CRC ok" } else { "CRC failed" })).collect();
+                println!("  FM {} record {:2} ({}, {} frame{}): FAILED, scanner saw [{}]", mode.name(), rec, l.describe(), count, if count == 1 { "" } else { "s" }, seen.join(", "));
+            }
+        }
+        println!("FM {} mode: {good} of {} records decoded", mode.name(), fm::RECORDS);
     }
     all_ok
 }

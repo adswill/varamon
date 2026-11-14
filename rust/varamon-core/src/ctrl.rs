@@ -243,7 +243,7 @@ fn find_states(tones: &[Tones], v: u32) -> Vec<u32> {
 }
 
 /// For every generator state: the seed arguments that start a stream there.
-struct SeedIndex {
+pub(crate) struct SeedIndex {
     first: Vec<u32>,
     more: HashMap<u32, Vec<u32>>,
 }
@@ -272,13 +272,13 @@ impl SeedIndex {
         Self { first, more }
     }
 
-    fn get(&self, state: u32) -> impl Iterator<Item = u32> + '_ {
+    pub(crate) fn get(&self, state: u32) -> impl Iterator<Item = u32> + '_ {
         let f = self.first[state as usize];
         (f != u32::MAX).then_some(f).into_iter().chain(self.more.get(&state).into_iter().flatten().copied())
     }
 }
 
-fn seed_index() -> &'static SeedIndex {
+pub(crate) fn seed_index() -> &'static SeedIndex {
     static INDEX: OnceLock<SeedIndex> = OnceLock::new();
     INDEX.get_or_init(SeedIndex::new)
 }

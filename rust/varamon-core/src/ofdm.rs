@@ -86,6 +86,21 @@ impl Front {
         Self::new(x, first as usize, nc as usize)
     }
 
+    /// Symbols cut from the slice.
+    pub fn symbols(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The cell of carrier `bi` (counted from the first bin) in symbol `q`, timing and tuning corrected.
+    pub fn cell_at(&self, q: usize, bi: usize) -> Complex64 {
+        self.rows[q][bi]
+    }
+
+    /// Where symbol 0 starts, in samples from the start of the slice.
+    pub fn phase(&self) -> usize {
+        self.phase
+    }
+
     pub fn fits(&self, g: &GridTables) -> bool {
         matches!(g.level.wave, Wave::Ofdm { nc, first, .. } if nc as usize == self.nc && first as usize == self.first)
     }

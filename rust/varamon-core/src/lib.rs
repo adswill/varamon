@@ -7,6 +7,8 @@ pub mod audio;
 pub mod b2f;
 pub mod crc;
 pub mod ctrl;
+pub mod fm;
+pub mod fmscan;
 pub mod frame;
 pub mod fsk;
 pub mod levels;
