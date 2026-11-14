@@ -39,6 +39,29 @@ fn main() {
             let bytes: Vec<u8> = x.iter().flat_map(|&v| (v as f32).to_le_bytes()).collect();
             std::fs::write(&a[4], bytes).unwrap();
         }
+        "book" => {
+            // vectool book BW 0 BASE FORMAT        every code the key alone gives, one per line
+            use varamon_core::ctrl;
+            let key = ctrl::Key { base: a[4].parse().unwrap(), steps: [0, 1, 2] };
+            let f: usize = a[5].parse().unwrap();
+            let show = |t: &[ctrl::Tones]| t.iter().map(|x| if f == 2 { format!("{}+{}", x[0], x[1]) } else { x[0].to_string() }).collect::<Vec<_>>().join(" ");
+            for (c, tones) in ctrl::session_book(key, f, bw).iter().enumerate().filter(|x| !x.1.is_empty()) {
+                println!("{c} {}", show(tones));
+            }
+            let called = key.base - 10 - ctrl::SIDE[0];
+            println!("req {}", show(&ctrl::request_code(called, f, bw)));
+            for side in 0..2 {
+                for (c, tones) in ctrl::fixed_codes(side, f) {
+                    println!("fixed{side}_{c} {}", show(&tones));
+                }
+            }
+            if let Some(caller) = a.get(6) {
+                for side in 0..2 {
+                    let pair = ctrl::connect_codes(caller.parse().unwrap(), side, f, bw);
+                    println!("conn{side}_49 {}\nconn{side}_50 {}", show(&pair[0]), show(&pair[1]));
+                }
+            }
+        }
         _ => panic!("unknown command"),
     }
 }

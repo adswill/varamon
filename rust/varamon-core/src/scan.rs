@@ -64,6 +64,8 @@ pub struct Control {
     pub format: Option<usize>,
     /// (code number, matching symbols, symbols in the code), once the station's key is known
     pub code: Option<(u32, usize, usize)>,
+    /// what the burst is when the key does not explain it: a connect request, BREAK, IDLE, CQ ...
+    pub other: Option<String>,
 }
 
 /// Everything heard, in time order.
@@ -499,12 +501,16 @@ fn assign_stations(events: &mut [Event]) {
 /// Scan a recording at 48 kHz. Returns every frame and control burst in time order, with the
 /// sending station worked out from the turn-taking.
 pub fn scan(x: &[f64], tables: &Tables) -> Scan {
+    scan_with(x, tables, &[])
+}
+
+/// As `scan`, with callsigns the listener already knows: connect requests to them, and BREAK or
+/// IDLE of links they started, are then named even if no header frame was heard.
+pub fn scan_with(x: &[f64], tables: &Tables, calls: &[String]) -> Scan {
     let mut events = Vec::new();
-    for (a, b, level_db) in segments(x) {
-        // 2 s margin before and 0.7 s after: a faded start or end is common off air
-        let lo = a.saturating_sub(2 * RATE);
-        let hi = (b + RATE * 7 / 10).min(x.len());
-        for (part, h) in decode_segment(&x[lo..hi], tables).into_iter().enumerate() {
+    let (list, db) = bursts(x);
+    let push = |events: &mut Vec<Event>, lo: usize, a: usize, b: usize, level_db: f64, hits: Vec<Hit>| {
+        for (part, h) in hits.into_iter().enumerate() {
             let frame_start = lo as f64 / RATE as f64 + h.start;
             events.push(Event::Frame(Found {
                 time: a as f64 / RATE as f64,
@@ -522,12 +528,44 @@ pub fn scan(x: &[f64], tables: &Tables) -> Scan {
                 part,
             }));
         }
+    };
+    // first pass: every unbroken stretch of signal long enough to be a frame. Stations take turns
+    // with pauses of a fraction of a second, so each stretch is one transmission.
+    for &(ta, tb) in list.iter().filter(|(a, b)| b - a >= 2.5) {
+        let (a, b) = ((ta * RATE as f64) as usize, ((tb * RATE as f64) as usize).min(x.len()));
+        let lo = a.saturating_sub(RATE * 3 / 10);
+        let hi = (b + RATE * 3 / 10).min(x.len());
+        let hits = decode_segment(&x[lo..hi], tables);
+        if hits.first().is_some_and(|h| h.crc_ok) {
+            push(&mut events, lo, a, b, level_of(&db, ta, tb), hits);
+        }
     }
+    // second pass: what is left once fades shorter than 0.45 s are bridged, for frames with a
+    // faded start, end or middle
+    for (a, b, level_db) in segments(x) {
+        let mut free = vec![(a, b)];
+        for e in &events {
+            let (s, t) = ((e.time() * RATE as f64) as usize, (e.end() * RATE as f64) as usize);
+            free = free.into_iter().flat_map(|(p, q)| if s >= q || t <= p { vec![(p, q)] } else { vec![(p, s.max(p)), (t.min(q), q)] }).filter(|(p, q)| q > p).collect();
+        }
+        for (a, b) in free.into_iter().filter(|(p, q)| q - p >= 3 * RATE) {
+            // a run of short bursts with pauses between them is control traffic, not a faded frame
+            let (ta, tb) = (a as f64 / RATE as f64, b as f64 / RATE as f64);
+            if list.iter().filter(|(s, e)| e.min(tb) - s.max(ta) > 0.5 * (e - s)).all(|(s, e)| e - s <= 1.8) {
+                continue;
+            }
+            // 2 s margin before and 0.7 s after: a faded start or end is common off air
+            let lo = a.saturating_sub(2 * RATE);
+            let hi = (b + RATE * 7 / 10).min(x.len());
+            let hits = decode_segment(&x[lo..hi], tables);
+            push(&mut events, lo, a, b, level_db, hits);
+        }
+    }
+    events.sort_by(|p, q| p.time().total_cmp(&q.time()));
     // short bursts that are not part of a frame: acknowledgements and other control signals
     let spans: Vec<(f64, f64)> = events.iter().map(|e| (e.time() - 0.1, e.end() + 0.05)).collect();
     // anything more than 25 dB below the strongest frame is noise, not a station
     let floor = events.iter().map(|e| e.level()).fold(f64::NEG_INFINITY, f64::max) - 25.0;
-    let (list, db) = bursts(x);
     for (a, b) in list {
         let (mut a, mut b) = (a, b);
         // cut away the part covered by a frame
@@ -544,12 +582,12 @@ pub fn scan(x: &[f64], tables: &Tables) -> Scan {
         }
         let level_db = level_of(&db, a, b);
         if b - a >= 0.25 && b - a < 3.0 && level_db >= floor {
-            events.push(Event::Control(Control { time: a, seconds: b - a, level_db, station: 0, format: None, code: None }));
+            events.push(Event::Control(Control { time: a, seconds: b - a, level_db, station: 0, format: None, code: None, other: None }));
         }
     }
     events.sort_by(|p, q| p.time().total_cmp(&q.time()));
     assign_stations(&mut events);
-    let keys = decode_control(x, &mut events);
+    let keys = decode_control(x, &mut events, calls);
     Scan { events, keys }
 }
 
@@ -561,11 +599,20 @@ pub struct Scan {
 }
 
 /// Measure every control burst, find each station's key from its own bursts and name the codes.
-fn decode_control(x: &[f64], events: &mut [Event]) -> Vec<(usize, crate::ctrl::Key)> {
+/// Bursts the key does not explain are tested as connect requests, BREAK, IDLE and the fixed codes.
+fn decode_control(x: &[f64], events: &mut [Event], calls: &[String]) -> Vec<(usize, crate::ctrl::Key)> {
     use crate::ctrl;
-    let mut offsets: Vec<f64> = events.iter().filter_map(|e| if let Event::Frame(f) = e { f.crc_ok.then_some(f.offset) } else { None }).collect();
+    let good: Vec<&Found> = events.iter().filter_map(|e| if let Event::Frame(f) = e { f.crc_ok.then_some(f) } else { None }).collect();
+    let mut offsets: Vec<f64> = good.iter().map(|f| f.offset).collect();
     offsets.sort_by(|a, b| a.total_cmp(b));
     let offset = offsets.get(offsets.len() / 2).copied().unwrap_or(0.0);
+    // the link's bandwidth mode: the one most frames were decoded in
+    let bw = Bandwidth::ALL.into_iter().max_by_key(|b| good.iter().filter(|f| f.mode == b.hz()).count()).unwrap_or(Bandwidth::Hz2300);
+    let bw = if good.is_empty() { Bandwidth::Hz2300 } else { bw };
+    // callsigns heard in header frames: (callsign, hash)
+    let mut heard: Vec<(String, u32)> = good.iter().filter_map(|f| crate::frame::header(&f.frame)).map(|h| (h.call.clone(), crate::frame::call_hash(&h.call))).collect();
+    heard.extend(calls.iter().map(|c| (c.to_uppercase(), crate::frame::call_hash(&c.to_uppercase()))));
+    let frame_ends: Vec<f64> = events.iter().filter_map(|e| if let Event::Frame(f) = e { Some(f.frame_end) } else { None }).collect();
     let mut measured: Vec<(usize, usize, ctrl::Measured)> = Vec::new(); // (event index, station, tones)
     for (i, e) in events.iter_mut().enumerate() {
         if let Event::Control(c) = e {
@@ -581,11 +628,51 @@ fn decode_control(x: &[f64], events: &mut [Event]) -> Vec<(usize, crate::ctrl::K
     stations.dedup();
     for st in stations {
         let own: Vec<ctrl::Measured> = measured.iter().filter(|m| m.1 == st).map(|m| m.2.clone()).collect();
-        if let Some(key) = ctrl::resolve(&own) {
+        if let Some(key) = ctrl::resolve(&own, bw) {
             keys.push((st, key));
             for (i, _, m) in measured.iter().filter(|m| m.1 == st) {
                 if let Event::Control(c) = &mut events[*i] {
-                    c.code = ctrl::identify(m, key);
+                    c.code = ctrl::identify(m, key, bw);
+                }
+            }
+        }
+    }
+    // callsign hashes worth testing: the ones heard, and both readings of every key
+    let mut known: Vec<u32> = heard.iter().map(|h| h.1).collect();
+    for (_, key) in &keys {
+        let (a, b) = key.hashes();
+        known.extend([a, b]);
+    }
+    known.sort_unstable();
+    known.dedup();
+    let name = |h: u32| heard.iter().find(|c| c.1 == h).map_or(format!("the station with callsign hash {h:06x}"), |c| c.0.clone());
+    let mut seen_requests: Vec<Vec<ctrl::Tones>> = Vec::new();
+    for (i, _, m) in &measured {
+        let Event::Control(c) = &mut events[*i] else { continue };
+        if c.code.is_some() || m.purity < 0.5 {
+            continue;
+        }
+        if let Some((what, hits, total)) = ctrl::identify_other(m, &known, bw) {
+            let text = match what {
+                ctrl::Other::Request { called, bw } => format!("CONNECT REQUEST to {}, {} Hz mode", name(called), bw.hz()),
+                ctrl::Other::Connect { code, caller, side } => {
+                    format!("{}, sent by the station that {} (link started by {})", ctrl::code_name(code), if side == 0 { "made the call" } else { "answered" }, name(caller))
+                }
+                ctrl::Other::Fixed { code } => ctrl::code_name(code).to_string(),
+            };
+            c.other = Some(format!("{text} ({hits} of {total} symbols)"));
+            continue;
+        }
+        // a long burst that does not follow a frame and is heard more than once is a call
+        let after_frame = frame_ends.iter().any(|&e| c.time > e - 0.1 && c.time < e + 1.0);
+        if m.format == 0 && !after_frame {
+            let repeated = measured.iter().filter(|o| o.2.format == 0 && o.2.tones == m.tones).count() >= 2;
+            if repeated {
+                if !seen_requests.contains(&m.tones) {
+                    seen_requests.push(m.tones.clone());
+                }
+                if let Some((called, req)) = ctrl::request_target(m) {
+                    c.other = Some(format!("repeated call, read as a CONNECT REQUEST to {}, {} Hz mode", name(called), req.hz()));
                 }
             }
         }
@@ -646,7 +733,7 @@ mod tests {
     use super::*;
 
     fn ctl(time: f64, seconds: f64, level_db: f64) -> Event {
-        Event::Control(Control { time, seconds, level_db, station: 9, format: None, code: None })
+        Event::Control(Control { time, seconds, level_db, station: 9, format: None, code: None, other: None })
     }
 
     fn stations(events: &[Event]) -> Vec<usize> {
@@ -681,5 +768,92 @@ mod tests {
         let mut e = vec![ctl(0.0, 5.0, 80.0), ctl(5.2, 0.7, 70.0), ctl(60.0, 5.0, 75.0), ctl(65.2, 0.7, 60.0)];
         assign_stations(&mut e);
         assert_eq!(stations(&e), [0, 1, 2, 3]);
+    }
+
+    /// A whole link from generated audio: two calls, the reply, header frames, data,
+    /// acknowledgements, IDLE, BREAK and GO AHEAD. Every burst must be named and the callsigns shown.
+    #[test]
+    fn link_start_is_read() {
+        use crate::ctrl::{self, Key};
+        use crate::frame::call_hash;
+        use crate::synth;
+        let tables = Tables::new();
+        let bw = Bandwidth::Hz2300;
+        let (caller, called) = (call_hash("N0CALL"), call_hash("N1CALL"));
+        let key = |side: usize| Key { base: called + 10 + ctrl::SIDE[side], steps: [0, 1, 2] };
+        let code = |side: usize, f: usize, c: u32| ctrl::session_book(key(side), f, bw)[c as usize].clone();
+        let unhex = |h: &str| (0..h.len() / 2).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()).collect::<Vec<u8>>();
+        let frame = |level: usize, f: &[u8], amp: f64| {
+            let mut n = 5u32;
+            let mut rand = |m: u32| {
+                n = n.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (n >> 16) % m
+            };
+            let x = synth::transmission(&bw.levels()[level - 1], &tables.mode(bw)[level - 1], &[f], &mut rand);
+            let top = x.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+            x.iter().map(|v| v / top * amp).collect::<Vec<f64>>()
+        };
+        let burst = |f: usize, lead: usize, tones: Vec<ctrl::Tones>, amp: f64| ctrl::audio(f, lead, &tones).iter().map(|v| v * amp).collect::<Vec<f64>>();
+        let header_caller = unhex("39b0c130c00000800183df5c"); // N0CALL, level 1
+        let mut header_called = crate::frame::pack_call("N1CALL").to_vec();
+        header_called.extend([0x00, 0x80, 0x02, 0x83]);
+        let crc = crate::crc::crc16(&header_called);
+        header_called.extend(crc.to_be_bytes());
+        assert_eq!(crate::frame::header(&header_called).map(|h| h.call), Some("N1CALL".to_string()));
+        // (pause before in seconds, audio); the caller is louder than the called station
+        let (a, b) = (0.5, 0.2);
+        let parts: Vec<(f64, Vec<f64>)> = vec![
+            (1.0, burst(0, 10, ctrl::request_code(called, 0, bw), a)),
+            (3.0, burst(0, 1, ctrl::request_code(called, 0, bw), a)),
+            (0.25, burst(1, 8, code(1, 1, 16), b)),
+            (0.25, frame(1, &header_caller, a)),
+            (0.25, burst(0, 1, code(1, 0, 1), b)),
+            (0.25, frame(1, &header_caller, a)),
+            (0.25, burst(1, 1, code(1, 1, 7), b)),
+            (0.25, burst(0, 1, ctrl::connect_codes(caller, 0, 0, bw)[1].clone(), a)),
+            (0.25, burst(0, 1, ctrl::connect_codes(caller, 1, 0, bw)[0].clone(), b)),
+            (0.25, burst(0, 1, code(0, 0, 14), a)),
+            (0.25, frame(1, &header_called, b)),
+            (0.25, burst(0, 1, code(0, 0, 1), a)),
+            (0.25, frame(1, &header_called, b)),
+            (0.25, burst(1, 1, code(0, 1, 5), a)),
+        ];
+        let mut x: Vec<f64> = Vec::new();
+        for (pause, audio) in &parts {
+            x.extend(std::iter::repeat(0.0).take((pause * RATE as f64) as usize));
+            x.extend(audio);
+        }
+        x.extend(std::iter::repeat(0.0).take(RATE));
+        let x = synth::on_air(&x, 0.5, 0.0, 3.0, 0.01, 77);
+        let result = scan(&x, &tables);
+        let lines: Vec<String> = result
+            .events
+            .iter()
+            .map(|e| match e {
+                Event::Frame(f) => format!("{} frame {}", f.station, crate::frame::header(&f.frame).map_or("?".to_string(), |h| h.call)),
+                Event::Control(c) => format!("{} {}", c.station, c.other.clone().unwrap_or_else(|| c.code.map_or("unknown".to_string(), |k| format!("code {}", k.0)))),
+            })
+            .collect();
+        let want = [
+            "0 CONNECT REQUEST to N1CALL, 2300 Hz mode",
+            "0 CONNECT REQUEST to N1CALL, 2300 Hz mode",
+            "1 code 16",
+            "0 frame N0CALL",
+            "1 code 1",
+            "0 frame N0CALL",
+            "1 code 7",
+            "0 IDLE, sent by the station that made the call (link started by N0CALL)",
+            "1 BREAK, sent by the station that answered (link started by N0CALL)",
+            "0 code 14",
+            "1 frame N1CALL",
+            "0 code 1",
+            "1 frame N1CALL",
+            "0 code 5",
+        ];
+        assert_eq!(lines.len(), want.len(), "{lines:#?}");
+        for (got, want) in lines.iter().zip(want) {
+            assert!(got.starts_with(want), "got {got:?}, want {want:?}\nall: {lines:#?}");
+        }
+        assert_eq!(result.keys.len(), 2);
     }
 }

@@ -33,11 +33,13 @@ It also decodes:
 - the special frame types of each mode (records 14-17 of the 500 Hz mode, record 17 of the 2300 Hz mode);
 - transmissions that carry several frames back to back;
 - the header frame at the start of a link, which gives the station's callsign;
-- control bursts (acknowledgements and similar), finding the station's key from the signal.
+- control bursts: all 58 codes in the three burst formats and the three tone sets. The station's key is found from the signal. Named: acknowledgements, connect requests and replies, BREAK, IDLE, GO AHEAD, start level, reject, disconnect, CQ.
 
 The bandwidth mode and level are worked out from the signal; nothing has to be set.
 
-Not decoded yet: the connection request burst, unconnected (broadcast) frames, VARA FM, VARA SAT. The Python version covers the 2300 Hz mode and the tone-keyed levels of the other two.
+A connect request names the called station only by a 24-bit number made from its callsign. varamon shows the callsign when it hears that station's header frame, or when you give it with `--call CALLSIGN`.
+
+Not decoded yet: unconnected (broadcast) frames, a short special frame sent on its own, VARA FM, VARA SAT. The Python version covers the 2300 Hz mode and the tone-keyed levels of the other two.
 
 ## Requirements
 
@@ -65,6 +67,7 @@ or run it from the folder without installing: `pip install numpy`, then `python 
 | `python -m varamon --hex recording.wav` | also prints the bytes of each decoded frame |
 | `python -m varamon --selftest` | decodes generated test signals |
 | `python -m varamon --help` | all options |
+| `varamon --call N0CALL recording.wav` | Rust version: name calls to a callsign you know |
 
 Recordings are 16-bit WAV of the receiver's audio in USB, at any sample rate. The first run prepares its tables, which takes about a minute; they are cached in `~/.varamon`. On Windows use `py` instead of `python`.
 
@@ -92,7 +95,9 @@ The web page shows the same list with a details pane, the frame bytes, a waterfa
 
 | Part | Verified against |
 |---|---|
-| 2300 Hz levels 1-2, control bursts | a real off-air recording |
+| 2300 Hz levels 1-2, acknowledgement bursts | a real off-air recording |
+| Control-code tables (4,536 codes: three modes, three formats, both directions) | outside test vectors (`tools/check_codebooks.py`) |
+| A whole link start: calls, reply, header frames, acknowledgements, IDLE, BREAK | generated audio (unit test) |
 | Frame coding of all 51 records (frame bytes to transmitted bits) | outside test vectors, bit for bit (`tools/check_vectors.py`) |
 | Waveform of the tone-keyed, phase-keyed and OFDM levels (2300 Hz mode) | samples of real transmissions (`tools/check_audio.py`): the generated audio differs by -36 dB or less |
 | Receivers of all 51 records | signals from that generator, with noise and a tuning offset (`varamon --selftest`) |
@@ -115,7 +120,7 @@ The project is being moved to Rust. The Rust version lives in `rust/` and will r
 | Callsign from the header frame | no | yes |
 | Command line for recordings | yes | yes |
 | Payload, stations, joined streams and text display | no | yes |
-| Control bursts (acknowledgements) with automatic key search | no | yes |
+| Control bursts: all 58 codes, automatic key search, connect requests | no | yes |
 | Unpacking the modem's "files" and text compression | no | yes |
 | Winlink mail transfers (B2F blocks, LZHUF) | no | yes |
 | Self-test over every record of every mode | 4 levels | all 51 |

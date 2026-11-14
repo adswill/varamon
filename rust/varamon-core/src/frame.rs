@@ -216,6 +216,30 @@ pub fn unpack_call(b: &[u8]) -> Option<String> {
     })
 }
 
+/// A callsign in its packed form (letters, digits, an optional suffix after a dash).
+pub fn pack_call(call: &str) -> [u8; 6] {
+    let (base, suffix) = call.split_once('-').unwrap_or((call, ""));
+    let ssid: u64 = match suffix {
+        "T" => 0x10,
+        "R" => 0x11,
+        "X" => 0x12,
+        "L" => 0x13,
+        n => n.parse().ok().filter(|v| (1..=0x13).contains(v)).unwrap_or(0),
+    };
+    let mut v = 0u64;
+    for i in 0..7 {
+        let c = match base.as_bytes().get(i) {
+            Some(c @ b'A'..=b'Z') => c - b'A' + 1,
+            Some(c @ b'0'..=b'9') => c - b'0' + 27,
+            _ => 0,
+        };
+        v = (v << 6) | u64::from(c);
+    }
+    v = (v << 6) | ssid;
+    let b = v.to_be_bytes();
+    [b[2], b[3], b[4], b[5], b[6], b[7]]
+}
+
 /// Read a frame as a header frame. `None` if it does not have the shape of one.
 pub fn header(frame: &[u8]) -> Option<Header> {
     let p = parse(frame)?;
@@ -251,6 +275,9 @@ mod header_tests {
         assert_eq!((h.call.as_str(), h.offer, h.compression), ("N0CALL", 2, 0));
         assert_eq!(call_hash("N0CALL"), 0xD80986);
         assert_eq!(unpack_call(&[0x04, 0x27, 0x03, 0x10, 0x00, 0x01]).as_deref(), Some("AB1CD-1"));
+        for call in ["N0CALL", "AB1CD-1", "W1AW-15", "N0CALL-T", "VE3ABCD-9"] {
+            assert_eq!(unpack_call(&pack_call(call)).as_deref(), Some(call));
+        }
     }
 
     #[test]

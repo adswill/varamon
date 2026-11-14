@@ -6,12 +6,13 @@ use std::process::ExitCode;
 use varamon_core::levels::Bandwidth;
 use varamon_core::{audio, b2f, ctrl, frame, scan, synth};
 
-const USAGE: &str = "usage: varamon [--hex] RECORDING.wav ...
+const USAGE: &str = "usage: varamon [--hex] [--mail] [--call CALLSIGN] RECORDING.wav ...
 
 Receive-only monitor for VARA HF signals. Recordings are 16-bit WAV of the receiver's audio in USB.
 
   --hex       also print the bytes of each decoded frame
   --mail      show the headers and text of mail messages (off by default: they are other people's mail)
+  --call CALLSIGN   a callsign you know (repeatable): calls to it and links it started are then named
   --selftest  generate a test signal for every level of every bandwidth mode and decode it
   --version   print the version
   --help      print this text";
@@ -31,7 +32,8 @@ fn main() -> ExitCode {
     }
     let hex = args.iter().any(|a| a == "--hex");
     let show_mail = args.iter().any(|a| a == "--mail");
-    let files: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let calls: Vec<String> = args.windows(2).filter(|w| w[0] == "--call").map(|w| w[1].clone()).collect();
+    let files: Vec<&String> = args.iter().enumerate().filter(|(i, a)| !a.starts_with("--") && (*i == 0 || args[i - 1] != "--call")).map(|x| x.1).collect();
     if files.is_empty() {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
@@ -49,13 +51,14 @@ fn main() -> ExitCode {
         };
         let name = Path::new(path).file_name().map_or(path.as_str().into(), |n| n.to_string_lossy());
         println!("{name}: {:.1} s", x.len() as f64 / audio::RATE as f64);
-        let result = scan::scan(&x, &tables);
+        let result = scan::scan_with(&x, &tables, &calls);
         let events = &result.events;
         let label = |s: usize| (b'A' + (s % 26) as u8) as char;
         for ev in events {
             let f = match ev {
                 scan::Event::Control(c) => {
                     let what = match (c.code, c.format) {
+                        _ if c.other.is_some() => c.other.clone().unwrap_or_default(),
                         (Some((code, hits, total)), _) => format!("{} (code {code}, {hits} of {total} symbols)", ctrl::code_name(code)),
                         (None, Some(_)) => "control burst, key not found".to_string(),
                         (None, None) => "short burst, not a control format".to_string(),
@@ -97,14 +100,15 @@ fn main() -> ExitCode {
         for (st, key) in &result.keys {
             let (caller, answerer) = key.hashes();
             // a callsign heard in a header frame may be this station's
-            let heard: Vec<String> = found.iter().filter(|f| f.crc_ok).filter_map(|f| frame::header(&f.frame)).map(|h| h.call).collect();
+            let mut heard: Vec<String> = found.iter().filter(|f| f.crc_ok).filter_map(|f| frame::header(&f.frame)).map(|h| h.call).collect();
+            heard.extend(calls.iter().map(|c| c.to_uppercase()));
             let who = heard.iter().find_map(|c| {
                 let h = frame::call_hash(c);
-                (h == caller).then(|| format!("{c}, the station that made the call")).or_else(|| (h == answerer).then(|| format!("{c}, the station that answered")))
+                (h == caller).then(|| format!("made the call to {c}")).or_else(|| (h == answerer).then(|| format!("is {c}, the station that was called")))
             });
             match who {
-                Some(w) => println!("station {} is {w}", label(*st)),
-                None => println!("station {} key found: callsign hash {caller:06x} if it made the call, {answerer:06x} if it answered", label(*st)),
+                Some(w) => println!("station {} {w}", label(*st)),
+                None => println!("station {} key found: the called station's callsign hash is {caller:06x} if station {} made the call, {answerer:06x} if it was the one called", label(*st), label(*st)),
             }
         }
         let stations = found.iter().map(|f| f.station + 1).max().unwrap_or(0);
