@@ -1,0 +1,3 @@
+# test data must stay byte for byte as it is: no line-ending conversion
+rust/varamon-core/tests/data/* -text
+rust/varamon-core/src/textcomp.dict -text
